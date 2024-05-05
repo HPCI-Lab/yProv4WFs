@@ -1,4 +1,5 @@
 from datetime import datetime
+from datamodel.enactor import Enactor
 
 #------------------NODE------------------–#
 class Node:
@@ -9,6 +10,7 @@ class Node:
         self._target = None
         self._start_time = None
         self._end_time = None
+        self._enactor = None
 
     def start(self):
         self._start_time = datetime.now()
@@ -20,6 +22,9 @@ class Node:
         if self._start_time and self._end_time:
             return self._end_time - self._start_time
         return None
+    
+    def set_enactor(self, enactor: 'Enactor'):
+        self._enactor = enactor
 
 
 

@@ -3,7 +3,9 @@ from typing import Union
 from datamodel.node import Node
 from datamodel.task import Task
 from datamodel.workflow import Workflow
+from datamodel.enactor import Enactor
 
+#------------------FileType------------------–#
 class FileType:
     def __init__(self, extension: str, mime_type: str):
         self._extension = extension
@@ -32,6 +34,7 @@ class Data:
         self._type = type
         self._producer = producer
         self._consumer = consumer
+        self._enactor = None
 
     def is_output(self, producer: Union['Task', 'Workflow']):
         if not isinstance(producer, (Task, Workflow)):
@@ -47,6 +50,9 @@ class Data:
         if self.type == exformat:
             self.type = newformat
         else: 
-            raise ValueError("The format of the input is not the expected format")    
+            raise ValueError("The format of the input is not the expected format")   
+
+    def set_enactor(self, enactor: 'Enactor'):
+        self._enactor = enactor 
 
 
