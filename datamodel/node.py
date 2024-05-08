@@ -26,26 +26,3 @@ class Node:
     def set_enactor(self, enactor: 'Enactor'):
         self._enactor = enactor
 
-
-
-
-
-# import networkx as nx
-# import matplotlib.pyplot as plt
-
-# #------------------VISUALIZATION------------------–#
-
-# def visualize_workflow(workflow):
-#     G = nx.DiGraph()
-
-#     # Add tasks to the graph
-#     for task in workflow._tasks:
-#         G.add_node(task._name)
-
-#     # Add edges between tasks
-#     for i in range(len(workflow._tasks) - 1):
-#         G.add_edge(workflow._tasks[i]._name, workflow._tasks[i + 1]._name)
-
-#     # Draw the graph
-#     nx.draw(G, with_labels=True)
-#     plt.show()
