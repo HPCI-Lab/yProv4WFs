@@ -1,0 +1,115 @@
+{
+    "prefix": {
+        "default": "http://anotherexample.org/"
+    },
+    "activity": {
+        "wfs1": {
+            "prov:label": "Workflow 1",
+            "prov:type": "prov:Activity"
+        },
+        "task1": {
+            "prov:label": "Task 1",
+            "prov:type": "prov:Activity"
+        },
+        "task2": {
+            "prov:label": "Task 2",
+            "prov:type": "prov:Activity"
+        }
+    },
+    "agent": {
+        "agent1": {
+            "prov:label": "Agent 1",
+            "prov:type": "prov:Agent"
+        },
+        "agent2": {
+            "prov:label": "Agent 2",
+            "prov:type": "prov:Agent"
+        }
+    },
+    "wasAssociatedWith": {
+        "_:id1": {
+            "prov:activity": "task1",
+            "prov:agent": "agent1"
+        },
+        "_:id6": {
+            "prov:activity": "task2",
+            "prov:agent": "agent2"
+        }
+    },
+    "entity": {
+        "data1": [
+            {
+                "prov:label": "Data 1",
+                "prov:type": "prov:Entity"
+            },
+            {
+                "prov:label": "Data 1",
+                "prov:type": "prov:Entity"
+            }
+        ],
+        "data3": [
+            {
+                "prov:label": "Data 3",
+                "prov:type": "prov:Entity"
+            },
+            {
+                "prov:label": "Data 3",
+                "prov:type": "prov:Entity"
+            }
+        ],
+        "data2": [
+            {
+                "prov:label": "Data 2",
+                "prov:type": "prov:Entity"
+            },
+            {
+                "prov:label": "Data 2",
+                "prov:type": "prov:Entity"
+            },
+            {
+                "prov:label": "Data 2",
+                "prov:type": "prov:Entity"
+            }
+        ]
+    },
+    "wasAttributedTo": {
+        "_:id2": {
+            "prov:entity": "data1",
+            "prov:agent": "agent1"
+        },
+        "_:id3": {
+            "prov:entity": "data3",
+            "prov:agent": "agent1"
+        },
+        "_:id7": {
+            "prov:entity": "data2",
+            "prov:agent": "agent2"
+        }
+    },
+    "used": {
+        "_:id4": {
+            "prov:activity": "task1",
+            "prov:entity": "data1"
+        },
+        "_:id9": {
+            "prov:activity": "task2",
+            "prov:entity": "data2"
+        }
+    },
+    "wasGeneratedBy": {
+        "_:id5": {
+            "prov:entity": "data2",
+            "prov:activity": "task1"
+        },
+        "_:id10": {
+            "prov:entity": "data3",
+            "prov:activity": "task2"
+        }
+    },
+    "wasInformedBy": {
+        "_:id8": {
+            "prov:informed": "task2",
+            "prov:informant": "task1"
+        }
+    }
+}
