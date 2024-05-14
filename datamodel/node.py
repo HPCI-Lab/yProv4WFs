@@ -25,4 +25,11 @@ class Node:
     
     def set_enactor(self, enactor: 'Enactor'):
         self._enactor = enactor
+        enactor._associated_with.append(self)
+
+    def set_source(self, source: 'Node'):
+        self._source = source
+
+    def set_target(self, target: 'Node'):
+        self._target = target
 

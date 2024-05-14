@@ -1,8 +1,4 @@
 import os
-from typing import Union
-from datamodel.node import Node
-from datamodel.task import Task
-from datamodel.workflow import Workflow
 from datamodel.enactor import Enactor
 
 #------------------FileType------------------–#
@@ -28,23 +24,29 @@ class FileType:
 
 #------------------DATA------------------–#
 class Data:
-    def __init__(self, id: str, name: str, type: FileType, producer: Union['Task', 'Workflow'], consumer: Union['Task', 'Workflow']):
+    def __init__(self, id: str, name: str, type: FileType):
         self._id = id
         self._name = name
         self._type = type
-        self._producer = producer
-        self._consumer = consumer
+        self._producer = None
+        self._consumer = None
         self._enactor = None
+        self.is_input = False
+        self.is_output = False
 
-    def is_output(self, producer: Union['Task', 'Workflow']):
-        if not isinstance(producer, (Task, Workflow)):
-            raise ValueError("producer must be an instance of Task or Workflow")
-        return self._producer == producer
+    def set_producer(self, producer):
+        self._producer = producer
+        self.is_output = True
 
-    def is_input(self, consumer: Union['Task', 'Workflow']):
-        if not isinstance(consumer, (Task, Workflow)):
-            raise ValueError("consumer must be an instance of Task or Workflow")
-        return self._consumer == consumer
+    def set_consumer(self, consumer):
+        self._consumer = consumer
+        self.is_input = True
+
+    # def is_input(self):
+    #     return self.is_input
+
+    # def is_output(self):
+    #     return self.is_output
     
     def changeType(self, exformat: FileType, newformat: FileType):
         if self.type == exformat:
@@ -54,5 +56,4 @@ class Data:
 
     def set_enactor(self, enactor: 'Enactor'):
         self._enactor = enactor 
-
-
+        enactor._attributed_to.append(self)

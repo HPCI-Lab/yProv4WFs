@@ -8,16 +8,13 @@ class Task(Node):
         self._inputs = []
         self._outputs = []
 
-    def get_input(self, data: 'Data'):
-        if data.is_input(self):
+    def add_input(self, data: Data):
+        data.set_consumer(self)
+        if data.is_input:
             self._inputs.append(data)
 
-    def get_output(self, data: 'Data'):
-        if data.is_output(self):
+    def add_output(self, data: Data):
+        data.set_producer(self)
+        if data.is_output:
             self._outputs.append(data)
     
-    def previous_task(self, source: 'Task'):
-        self._source = source
-
-    def next_task(self, target: 'Task'):
-        self._target = target
