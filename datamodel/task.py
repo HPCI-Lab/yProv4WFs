@@ -18,3 +18,15 @@ class Task(Node):
         if data.is_output:
             self._outputs.append(data)
     
+    # def to_dict(self):
+    #     return {
+    #         'id': self._id,
+    #         'start_time': self._start_time,
+    #         'end_time': self._end_time,
+    #         'name': self._name,
+    #         'inputs': self._inputs,
+    #         'outputs': self._outputs,
+    #         'source': self._source,
+    #         'target': self._target,
+    #         'enactor': self._enactor
+    #     }
