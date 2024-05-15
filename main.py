@@ -5,7 +5,7 @@ from datamodel.data import Data, FileType
 from datamodel.enactor import Enactor
 
 def test_workflow_to_prov():
-    # Create some Agent objects
+    # Create some Enactor objects
     agent1 = Enactor('agent1','Agent 1')
     agent2 = Enactor('agent2','Agent 2')
 
@@ -37,11 +37,7 @@ def test_workflow_to_prov():
     workflow.add_task(task2)
     workflow._end_time = workflow.end()
 
-    # Call the to_prov method and print the result
-    prov_json = workflow.to_prov()
-    prov_dict = json.loads(prov_json)
-    with open('workflow_prov.json', 'w') as f:
-        json.dump(prov_dict, f, indent=4)
+    workflow.prov_to_json()
 
 
 test_workflow_to_prov()

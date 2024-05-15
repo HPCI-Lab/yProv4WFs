@@ -14,9 +14,11 @@ class Node:
 
     def start(self):
         self._start_time = datetime.now()
+        return self._start_time
 
     def end(self):
         self._end_time = datetime.now()
+        return self._end_time
 
     def duration(self):
         if self._start_time and self._end_time:

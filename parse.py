@@ -1,6 +1,5 @@
 import json
 from datetime import datetime
-from datamodel.node import Node
 from datamodel.workflow import Workflow
 from datamodel.task import Task
 from datamodel.data import Data, FileType

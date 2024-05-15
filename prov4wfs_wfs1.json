@@ -4,6 +4,8 @@
     },
     "activity": {
         "wfs1": {
+            "prov:startTime": "2024-05-15T13:25:53.535266",
+            "prov:endTime": "2024-05-15T13:25:53.535270",
             "prov:label": "Workflow 1",
             "prov:type": "prov:Activity"
         },
@@ -24,16 +26,6 @@
         "agent2": {
             "prov:label": "Agent 2",
             "prov:type": "prov:Agent"
-        }
-    },
-    "wasAssociatedWith": {
-        "_:id1": {
-            "prov:activity": "task1",
-            "prov:agent": "agent1"
-        },
-        "_:id6": {
-            "prov:activity": "task2",
-            "prov:agent": "agent2"
         }
     },
     "entity": {
@@ -73,16 +65,26 @@
         ]
     },
     "wasAttributedTo": {
-        "_:id2": {
+        "_:id1": {
             "prov:entity": "data1",
             "prov:agent": "agent1"
         },
-        "_:id3": {
+        "_:id2": {
             "prov:entity": "data3",
             "prov:agent": "agent1"
         },
-        "_:id7": {
+        "_:id6": {
             "prov:entity": "data2",
+            "prov:agent": "agent2"
+        }
+    },
+    "wasAssociatedWith": {
+        "_:id3": {
+            "prov:activity": "task1",
+            "prov:agent": "agent1"
+        },
+        "_:id7": {
+            "prov:activity": "task2",
             "prov:agent": "agent2"
         }
     },
