@@ -4,8 +4,8 @@
     },
     "activity": {
         "wfs1": {
-            "prov:startTime": "2024-05-15T13:25:53.535266",
-            "prov:endTime": "2024-05-15T13:25:53.535270",
+            "prov:startTime": "2024-05-24T16:54:23.751324",
+            "prov:endTime": "2024-05-24T16:54:23.751329",
             "prov:label": "Workflow 1",
             "prov:type": "prov:Activity"
         },
@@ -16,6 +16,16 @@
         "task2": {
             "prov:label": "Task 2",
             "prov:type": "prov:Activity"
+        }
+    },
+    "wasStartedBy": {
+        "_:id1": {
+            "prov:activity": "task1",
+            "prov:trigger": "wfs1"
+        },
+        "_:id7": {
+            "prov:activity": "task2",
+            "prov:trigger": "wfs1"
         }
     },
     "agent": {
@@ -65,51 +75,51 @@
         ]
     },
     "wasAttributedTo": {
-        "_:id1": {
+        "_:id2": {
             "prov:entity": "data1",
             "prov:agent": "agent1"
         },
-        "_:id2": {
+        "_:id3": {
             "prov:entity": "data3",
             "prov:agent": "agent1"
         },
-        "_:id6": {
+        "_:id8": {
             "prov:entity": "data2",
             "prov:agent": "agent2"
         }
     },
     "wasAssociatedWith": {
-        "_:id3": {
+        "_:id4": {
             "prov:activity": "task1",
             "prov:agent": "agent1"
         },
-        "_:id7": {
+        "_:id9": {
             "prov:activity": "task2",
             "prov:agent": "agent2"
         }
     },
     "used": {
-        "_:id4": {
+        "_:id5": {
             "prov:activity": "task1",
             "prov:entity": "data1"
         },
-        "_:id9": {
+        "_:id10": {
             "prov:activity": "task2",
             "prov:entity": "data2"
         }
     },
     "wasGeneratedBy": {
-        "_:id5": {
+        "_:id6": {
             "prov:entity": "data2",
             "prov:activity": "task1"
         },
-        "_:id10": {
+        "_:id11": {
             "prov:entity": "data3",
             "prov:activity": "task2"
         }
     },
     "wasInformedBy": {
-        "_:id8": {
+        "_:id12": {
             "prov:informed": "task2",
             "prov:informant": "task1"
         }

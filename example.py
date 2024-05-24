@@ -9,9 +9,9 @@ def test_workflow_to_prov():
     agent2 = Enactor('agent2','Agent 2')
 
     # Create some Data objects
-    data1 = Data('data1', 'Data 1', "txt")
-    data2 = Data('data2', 'Data 2', "txt")
-    data3 = Data('data3', 'Data 3', "txt")
+    data1 = Data('data1', 'Data 1')
+    data2 = Data('data2', 'Data 2')
+    data3 = Data('data3', 'Data 3')
     data1.set_enactor(agent1)
     data2.set_enactor(agent2)
     data3.set_enactor(agent1)
