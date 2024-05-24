@@ -24,29 +24,32 @@ class FileType:
 
 #------------------DATA------------------–#
 class Data:
-    def __init__(self, id: str, name: str, type: FileType):
+    def __init__(self, id: str, name: str):
         self._id = id
         self._name = name
-        self._type = type
+        self._type = None
         self._producer = None
         self._consumer = None
         self._enactor = None
         self.is_input = False
         self.is_output = False
+        
+    def set_type(self, type: FileType):
+        self._type = type
 
-    def set_producer(self, producer):
+    def set_producer(self, producer: str):
         self._producer = producer
         self.is_output = True
 
-    def set_consumer(self, consumer):
+    def set_consumer(self, consumer: str):
         self._consumer = consumer
         self.is_input = True
 
-    # def is_input(self):
-    #     return self.is_input
+    def is_input(self):
+        return self.is_input
 
-    # def is_output(self):
-    #     return self.is_output
+    def is_output(self):
+        return self.is_output
     
     def changeType(self, exformat: FileType, newformat: FileType):
         if self.type == exformat:
