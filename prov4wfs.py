@@ -38,8 +38,6 @@ class Prov4WfsExecutor(StreamFlowExecutor):
     
     async def populate_prov_workflow(self):
         self.prov_workflow = Workflow(self.workflow.name, f'workflow_{self.workflow.name}')
-        
-
         self.prov_workflow._start_time = streamflow.core.utils.get_date_from_ns(self.runtime_data['start_time'])
         
         # for task in self.workflow.steps.values():
@@ -52,9 +50,10 @@ class Prov4WfsExecutor(StreamFlowExecutor):
                 
                 for inp_key, inp_port in t.input_ports.items():
                     if i := t.get_input_port(inp_key):
-                        prov_input = Data(str((uuid.uuid4())),i.name)
+                        # prov_input = Data(str((uuid.uuid4())),i.name)
+                        prov_input = Data(i.name,i.name)
                         prov_task.add_input(prov_input)
-                        prov_input.set_consumer(prov_task._name)
+                        prov_input.set_consumer(prov_task._id)
                         
                         ex_d_in = {
                             "id": prov_input._id,
@@ -63,10 +62,10 @@ class Prov4WfsExecutor(StreamFlowExecutor):
                         }
                         print(ex_d_in)
                 for out_key, out_value in t.output_ports.items():
-                    if o := t.get_input_port(out_key):
-                        prov_output = Data(str((uuid.uuid4())),o.name)
+                    if o := t.get_output_port(out_key):
+                        prov_output = Data(o.name,o.name)
                         prov_task.add_output(prov_output)
-                        prov_output.set_producer(prov_task._name)
+                        prov_output.set_producer(prov_task._id)
                         ex_d_out = {
                             "id": prov_output._id,
                             "name": prov_output._name,
@@ -162,7 +161,7 @@ class Prov4WfsExecutor(StreamFlowExecutor):
                 )
                 
                 self.runtime_data['end_time'] = end_time
-                self.runtime_data['status'] = self.get_status(Status.COMPLETED)
+                self.runtime_data['status'] = Status.COMPLETED
             # Print output tokens
             return output_tokens
         except Exception:
@@ -173,7 +172,7 @@ class Prov4WfsExecutor(StreamFlowExecutor):
                     {"status": Status.FAILED.value, "end_time": end_time},
                 )
                 self.runtime_data['end_time'] = end_time
-                self.runtime_data['status'] = self.get_status(Status.FAILED)
+                self.runtime_data['status'] = Status.FAILED
             if not self.closed:
                 await self._shutdown()
             raise

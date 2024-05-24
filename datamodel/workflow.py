@@ -11,6 +11,14 @@ class Workflow(Node):
         self._inputs = []
         self._outputs = []
         self._tasks = []
+        self._num_tasks = None
+        self._tasks_done = None
+        self._tasks_failed = None
+        self._taks_skipped = None
+        self._type = None
+        self._engineWMS = None
+        self._resource_cwl_uri = None
+        
     def add_input(self, data: Data):
         data.set_consumer(self)
         if data.is_input():
@@ -45,12 +53,15 @@ class Workflow(Node):
                 'prov:label': task._name,
                 'prov:type': 'prov:Activity'
                 })
+            # Add wasStartedBy relation between task and workflow
+            doc.wasStartedBy(task._id, self._id, None)
+            
             if task._enactor is not None:
                 doc.agent(task._enactor._id, {
                     'prov:label': task._enactor._name,
                     'prov:type': 'prov:Agent'
                 })
-            # Add wasAttributedTo relations between enactor and data items
+                # Add wasAttributedTo relations between enactor and data items
                 for data_item in task._enactor._attributed_to:
                     if data_item is not None: 
                         doc.entity(data_item._id, {
@@ -86,13 +97,13 @@ class Workflow(Node):
                             'prov:type': 'prov:Entity'
                     })
                 # doc.wasGeneratedBy(data_item._id, task._id)
-                doc.wasGeneratedBy(data_item._name, task._name)
+                doc.wasGeneratedBy(data_item._id, task._id)
 
                 
             # Add wasInformedBy relation between tasks
             if task._source is not None:
                 # doc.wasInformedBy(task._id, task._source._id)
-                doc.wasInformedBy(task._name, task._source._name)
+                doc.wasInformedBy(task._id, task._source._id)
 
         return doc.serialize(format='json')
     def prov_to_json(self):
@@ -101,7 +112,7 @@ class Workflow(Node):
         with open(json_file_path, 'w') as f:
             json.dump(prov_dict, f, indent=4)
         return json_file_path
-    
+
     
 
 #     from datamodel.node import Node

@@ -6,8 +6,6 @@ class Node:
     def __init__(self, id: str, name: str):
         self._id = id
         self._name = name
-        self._source = None
-        self._target = None
         self._start_time = None
         self._end_time = None
         self._enactor = None
@@ -30,12 +28,6 @@ class Node:
     def set_enactor(self, enactor: 'Enactor'):
         self._enactor = enactor
         enactor._associated_with.append(self)
-
-    def set_source(self, source: 'Node'):
-        self._source = source
-
-    def set_target(self, target: 'Node'):
-        self._target = target
 
     def add_description(self, description: str):
         self._description = description

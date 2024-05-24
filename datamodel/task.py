@@ -7,6 +7,8 @@ class Task(Node):
         super().__init__(id, name)
         self._inputs = []
         self._outputs = []
+        self._source = None
+        self._target = None
 
     def add_input(self, data: Data):
         data.set_consumer(self._name)
@@ -16,4 +18,10 @@ class Task(Node):
     def add_output(self, data: Data):
         data.set_producer(self._name)
         if data.is_output:
-            self._outputs.append(data)   
+            self._outputs.append(data)
+            
+    def set_source(self, source: 'Task'):
+        self._source = source
+
+    def set_target(self, target: 'Task'):
+        self._target = target   
