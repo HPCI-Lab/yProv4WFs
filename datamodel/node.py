@@ -11,6 +11,8 @@ class Node:
         self._start_time = None
         self._end_time = None
         self._enactor = None
+        self._description = None
+        self._status = None
 
     def start(self):
         self._start_time = datetime.now()
@@ -35,3 +37,5 @@ class Node:
     def set_target(self, target: 'Node'):
         self._target = target
 
+    def add_description(self, description: str):
+        self._description = description

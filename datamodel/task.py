@@ -9,24 +9,11 @@ class Task(Node):
         self._outputs = []
 
     def add_input(self, data: Data):
-        data.set_consumer(self)
+        data.set_consumer(self._name)
         if data.is_input:
             self._inputs.append(data)
 
     def add_output(self, data: Data):
-        data.set_producer(self)
+        data.set_producer(self._name)
         if data.is_output:
-            self._outputs.append(data)
-    
-    # def to_dict(self):
-    #     return {
-    #         'id': self._id,
-    #         'start_time': self._start_time,
-    #         'end_time': self._end_time,
-    #         'name': self._name,
-    #         'inputs': self._inputs,
-    #         'outputs': self._outputs,
-    #         'source': self._source,
-    #         'target': self._target,
-    #         'enactor': self._enactor
-    #     }
+            self._outputs.append(data)   

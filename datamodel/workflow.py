@@ -11,29 +11,31 @@ class Workflow(Node):
         self._inputs = []
         self._outputs = []
         self._tasks = []
-
     def add_input(self, data: Data):
         data.set_consumer(self)
         if data.is_input():
             self._inputs.append(data)
-
     def add_output(self, data: Data):
         data.set_producer(self)
         if data.is_output():
             self._outputs.append(data)
-
     def add_task(self, task: 'Task'): 
         if self._tasks:
             last_task = self._tasks[-1]
             last_task.set_target(task)
             task.set_source(last_task)
         self._tasks.append(task)
-
+    def get_task_by_id(self, id):
+        for task in self._tasks:
+            if task.id == id:
+                return task
+        return None
+    
     def to_prov(self):
         doc = prov.ProvDocument()
         doc.set_default_namespace('http://anotherexample.org/')
         
-        doc.activity(self._id, self._start_time, self._end_time, {
+        doc.activity(self._id, self._start_time, self._end_time,{
             'prov:label': self._name,
             'prov:type': 'prov:Activity'
         })
@@ -48,15 +50,15 @@ class Workflow(Node):
                     'prov:label': task._enactor._name,
                     'prov:type': 'prov:Agent'
                 })
-
-                # Add wasAttributedTo relations between enactor and data items
+            # Add wasAttributedTo relations between enactor and data items
                 for data_item in task._enactor._attributed_to:
-                    doc.entity(data_item._id, {
-                        'prov:label': data_item._name,
-                        'prov:type': 'prov:Entity'
-                    })
-                    doc.wasAttributedTo(data_item._id, task._enactor._id)
-
+                    if data_item is not None: 
+                        doc.entity(data_item._id, {
+                            'prov:label': data_item._name,
+                            'prov:type': 'prov:Entity'
+                        })
+                        doc.wasAttributedTo(data_item._id, task._enactor._id)
+                
                 # Add actedOnBehalfOf relations between enactor and the enactors it acted for
                 if task._enactor._acted_for is not None:
                     doc.agent(task._enactor._acted_for._id, {
@@ -68,34 +70,39 @@ class Workflow(Node):
                 # Add wasAssociatedWith relation between task and enactor
                 doc.wasAssociatedWith(task._id, task._enactor._id)
 
-            # Add wasInformedBy relation between tasks
-            if task._source is not None:
-                doc.wasInformedBy(task._id, task._source._id)
-
+                      
             # Add used and wasGeneratedBy relations for inputs and outputs
             for data_item in task._inputs:
-                doc.entity(data_item._id, {
-                        'prov:label': data_item._name,
-                        'prov:type': 'prov:Entity'
-                })
-                doc.used(task._id, data_item._id)
+                if data_item is not None:
+                    doc.entity(data_item._id, {
+                            'prov:label': data_item._name,
+                            'prov:type': 'prov:Entity'
+                    })
+                    doc.used(task._id, data_item._id)
             for data_item in task._outputs:
-                doc.entity(data_item._id, {
-                        'prov:label': data_item._name,
-                        'prov:type': 'prov:Entity'
-                })
-            doc.wasGeneratedBy(data_item._id, task._id)
+                if data_item is not None:
+                    doc.entity(data_item._id, {
+                            'prov:label': data_item._name,
+                            'prov:type': 'prov:Entity'
+                    })
+                # doc.wasGeneratedBy(data_item._id, task._id)
+                doc.wasGeneratedBy(data_item._name, task._name)
+
+                
+            # Add wasInformedBy relation between tasks
+            if task._source is not None:
+                # doc.wasInformedBy(task._id, task._source._id)
+                doc.wasInformedBy(task._name, task._source._name)
 
         return doc.serialize(format='json')
-    
-
     def prov_to_json(self):
         prov_dict = json.loads(self.to_prov())
-        with open(f'prov4wfs_{self._id}.json', 'w') as f:
-            prov_to_json = json.dump(prov_dict, f, indent=4)
-        return prov_to_json
-
-
+        json_file_path = f'prov4wfs_{self._id}.json'
+        with open(json_file_path, 'w') as f:
+            json.dump(prov_dict, f, indent=4)
+        return json_file_path
+    
+    
 
 #     from datamodel.node import Node
 # from datamodel.data import Data
