@@ -16,7 +16,7 @@ from streamflow.workflow.step import ExecuteStep
 from datamodel.workflow import Workflow
 from datamodel.task import Task
 from datamodel.data import Data, FileType
-from datamodel.enactor import Enactor
+from datamodel.agent import Agent
 
 
 class Prov4WfsExecutor(StreamFlowExecutor):

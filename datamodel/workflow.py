@@ -30,8 +30,8 @@ class Workflow(Node):
     def add_task(self, task: 'Task'): 
         if self._tasks:
             last_task = self._tasks[-1]
-            last_task.set_target(task)
-            task.set_source(last_task)
+            last_task.set_next(task)
+            task.set_prev(last_task)
         self._tasks.append(task)
     def get_task_by_id(self, id):
         for task in self._tasks:
@@ -47,39 +47,39 @@ class Workflow(Node):
             'prov:label': self._name,
             'prov:type': 'prov:Activity'
         })
-        # Add tasks as activities and enactors as agents
+        # Add tasks as activities and agents as agents
         for task in self._tasks:
             doc.activity(task._id, task._start_time, task._end_time, {
                 'prov:label': task._name,
                 'prov:type': 'prov:Activity'
                 })
             # Add wasStartedBy relation between task and workflow
-            doc.wasStartedBy(task._id, self._id, None)
+            # doc.wasStartedBy(task._id, self._id, None)
             
-            if task._enactor is not None:
-                doc.agent(task._enactor._id, {
-                    'prov:label': task._enactor._name,
+            if task._agent is not None:
+                doc.agent(task._agent._id, {
+                    'prov:label': task._agent._name,
                     'prov:type': 'prov:Agent'
                 })
-                # Add wasAttributedTo relations between enactor and data items
-                for data_item in task._enactor._attributed_to:
+                # Add wasAttributedTo relations between agent and data items
+                for data_item in task._agent._attributed_to:
                     if data_item is not None: 
                         doc.entity(data_item._id, {
                             'prov:label': data_item._name,
                             'prov:type': 'prov:Entity'
                         })
-                        doc.wasAttributedTo(data_item._id, task._enactor._id)
+                        doc.wasAttributedTo(data_item._id, task._agent._id)
                 
-                # Add actedOnBehalfOf relations between enactor and the enactors it acted for
-                if task._enactor._acted_for is not None:
-                    doc.agent(task._enactor._acted_for._id, {
-                        'prov:label': task._enactor._acted_for._name,
+                # Add actedOnBehalfOf relations between agent and the agents it acted for
+                if task._agent._acted_for is not None:
+                    doc.agent(task._agent._acted_for._id, {
+                        'prov:label': task._agent._acted_for._name,
                         'prov:type': 'prov:Agent'
                     })
-                    doc.actedOnBehalfOf(task._enactor._id, task._enactor._acted_for._id)
+                    doc.actedOnBehalfOf(task._agent._id, task._agent._acted_for._id)
 
-                # Add wasAssociatedWith relation between task and enactor
-                doc.wasAssociatedWith(task._id, task._enactor._id)
+                # Add wasAssociatedWith relation between task and agent
+                doc.wasAssociatedWith(task._id, task._agent._id)
 
                       
             # Add used and wasGeneratedBy relations for inputs and outputs
@@ -101,9 +101,9 @@ class Workflow(Node):
 
                 
             # Add wasInformedBy relation between tasks
-            if task._source is not None:
-                # doc.wasInformedBy(task._id, task._source._id)
-                doc.wasInformedBy(task._id, task._source._id)
+            if task._prev is not None:
+                # doc.wasInformedBy(task._id, task._prev._id)
+                doc.wasInformedBy(task._id, task._prev._id)
 
         return doc.serialize(format='json')
     def prov_to_json(self):

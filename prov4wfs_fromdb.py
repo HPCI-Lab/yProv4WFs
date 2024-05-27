@@ -18,7 +18,7 @@ from streamflow.log_handler import logger
 from datamodel.workflow import Workflow
 from datamodel.task import Task
 from datamodel.data import Data, FileType
-from datamodel.enactor import Enactor
+from datamodel.agent import Agent
 
 
 def _get_cwl_entity_id(entity_id: str) -> str:
