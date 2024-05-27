@@ -1,5 +1,5 @@
 from datetime import datetime
-from datamodel.enactor import Enactor
+from datamodel.agent import Agent
 
 #------------------NODE------------------–#
 class Node:
@@ -8,7 +8,7 @@ class Node:
         self._name = name
         self._start_time = None
         self._end_time = None
-        self._enactor = None
+        self._agent = None
         self._description = None
         self._status = None
 
@@ -25,9 +25,9 @@ class Node:
             return self._end_time - self._start_time
         return None
     
-    def set_enactor(self, enactor: 'Enactor'):
-        self._enactor = enactor
-        enactor._associated_with.append(self)
+    def set_agent(self, agent: 'Agent'):
+        self._agent = agent
+        agent._associated_with.append(self)
 
     def add_description(self, description: str):
         self._description = description

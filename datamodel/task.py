@@ -7,8 +7,8 @@ class Task(Node):
         super().__init__(id, name)
         self._inputs = []
         self._outputs = []
-        self._source = None
-        self._target = None
+        self._prev = None
+        self._next = None
 
     def add_input(self, data: Data):
         data.set_consumer(self._name)
@@ -20,8 +20,8 @@ class Task(Node):
         if data.is_output:
             self._outputs.append(data)
             
-    def set_source(self, source: 'Task'):
-        self._source = source
+    def set_prev(self, prev: 'Task'):
+        self._prev = prev
 
-    def set_target(self, target: 'Task'):
-        self._target = target   
+    def set_next(self, next: 'Task'):
+        self._next = next   

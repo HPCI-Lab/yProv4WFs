@@ -1,5 +1,5 @@
 import os
-from datamodel.enactor import Enactor
+from datamodel.agent import Agent
 
 #------------------FileType------------------–#
 class FileType:
@@ -30,7 +30,7 @@ class Data:
         self._type = None
         self._producer = None
         self._consumer = None
-        self._enactor = None
+        self._agent = None
         self.is_input = False
         self.is_output = False
         
@@ -57,6 +57,6 @@ class Data:
         else: 
             raise ValueError("The format of the input is not the expected format")   
 
-    def set_enactor(self, enactor: 'Enactor'):
-        self._enactor = enactor 
-        enactor._attributed_to.append(self)
+    def set_agent(self, agent: 'Agent'):
+        self._agent = agent 
+        agent._attributed_to.append(self)
