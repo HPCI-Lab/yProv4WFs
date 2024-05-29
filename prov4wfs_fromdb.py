@@ -21,14 +21,7 @@ from datamodel.data import Data, FileType
 from datamodel.agent import Agent
 
 
-def _get_cwl_entity_id(entity_id: str) -> str:
-    tokens = entity_id.split("#")
-    if len(tokens) > 1:
-        return "#".join([tokens[0].split("/")[-1], tokens[1]])
-    else:
-        return tokens[0].split("/")[-1]
-    
-def _get_status(status: Status) -> str:
+def _get_action_status(status: Status) -> str:
     if status == Status.COMPLETED:
         return "Completed"
     elif status == Status.FAILED:
@@ -38,7 +31,7 @@ def _get_status(status: Status) -> str:
     else:
         raise WorkflowProvenanceException(f"Action status {status.name} not supported.")
 
-class PROW4WFSProvenanceManagerStreamFlow(ProvenanceManager):
+class PROW4WFSProvenanceManager(ProvenanceManager):
     def __init__(
         self,
         context: StreamFlowContext,
@@ -63,15 +56,41 @@ class PROW4WFSProvenanceManagerStreamFlow(ProvenanceManager):
         additional_files: Optional[MutableSequence[MutableMapping[str, str]]],
         additional_properties: Optional[MutableSequence[MutableMapping[str, str]]],
     ):
+        #SERVE BHO???
         if config:
             self.map_file[config] = config
-  
+            
         for wf in self.workflows:
             wf_obj = await self.context.database.get_workflow(wf.persistent_id)
             workflow = Workflow(wf_obj["name"], f'workflow_{wf_obj["name"]}')
             workflow._start_time = streamflow.core.utils.get_date_from_ns(wf_obj["start_time"])
             workflow._end_time = streamflow.core.utils.get_date_from_ns(wf_obj["end_time"])
-            workflow._status = _get_status(Status(wf_obj["status"]))
+            workflow._status = _get_action_status(Status(wf_obj["status"]))
+            if config:
+                workflow._resource_cwl_uri = config
+            workflow._engineWMS = 'StreamFlow'
+            
+            for input in await self.context.database.get_input_ports(wf.persistent_id):
+                data_in = Data(str(uuid.uuid4()), input["name"])
+                workflow.add_input(data_in)
+                data_in.set_consumer(workflow._id)
+                execution_input = {
+                    "id": data_in._id,
+                    "name": data_in._name,
+                    "consumer": data_in._consumer
+                }
+                print(execution_input)
+                            
+            for output in await self.context.database.get_output_ports(wf.persistent_id):
+                data_out = Data(str(uuid.uuid4()), output["name"])
+                workflow.add_output(data_out)
+                data_out.set_producer(workflow._id)
+                execution_output = {
+                    "id": data_out._id,
+                    "name": data_out._name,
+                    "producer": data_out._producer
+                }
+                print(execution_output)
             
             execution_wf = {
                 "id": workflow._id,
@@ -79,16 +98,21 @@ class PROW4WFSProvenanceManagerStreamFlow(ProvenanceManager):
                 "endTime": workflow._end_time,
                 "name": workflow._name,
                 "startTime": workflow._start_time,
+                "engineWMS": workflow._engineWMS,
+                "resource_uri": workflow._resource_cwl_uri,
+                "input": {i: i for i in workflow._inputs},
+                "output": {o: o for o in workflow._outputs},
             }
             print(execution_wf)
-
-            for step in wf.steps:
-                if s := wf.steps.get(step): 
+            
+            for task in wf.steps:
+                if s := wf.steps.get(task):
                     for execution_wf in await self.context.database.get_executions_by_step(s.persistent_id):
-                        task = Task(str(uuid.uuid4()), step)
+                        task = Task(str(uuid.uuid4()), task)
                         task._start_time = streamflow.core.utils.get_date_from_ns(execution_wf["start_time"])
                         task._end_time = streamflow.core.utils.get_date_from_ns(execution_wf["end_time"])
-                        task._status = _get_status(Status(execution_wf["status"]))
+                        task._status = _get_action_status(Status(execution_wf["status"]))
+                        
                         # task.set_enactor(workflow.get_enactor_by_id(step.enactor_id))
                         
                         execution_task = {
@@ -99,10 +123,30 @@ class PROW4WFSProvenanceManagerStreamFlow(ProvenanceManager):
                             "startTime": task._start_time,
                         }
                         print(execution_task)
-                                
-                        # process Input and Output
+                   
+                        for input in await self.context.database.get_input_ports(s.persistent_id):
+                            data_in = Data(str(uuid.uuid4()), input["name"])
+                            task.add_input(data_in)
+                            data_in.set_consumer(task._id)
+                            execution_input = {
+                                "id": data_in._id,
+                                "name": data_in._name,
+                                "consumer": data_in._consumer
+                            }
+                            print(execution_input)
                             
-                        workflow.add_task(task) 
+                        for output in await self.context.database.get_output_ports(s.persistent_id):
+                            data_out = Data(str(uuid.uuid4()), output["name"])
+                            task.add_output(data_out)
+                            data_out.set_producer(task._id)
+                            execution_output = {
+                                "id": data_out._id,
+                                "name": data_out._name,
+                                "producer": data_out._producer
+                            }
+                            print(execution_output)
+                            
+                        workflow.add_task(task)              
                 
         os.makedirs(outdir, exist_ok=True)
         path = os.path.join(outdir, filename or (self.workflows[0].name + ".zip"))

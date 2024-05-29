@@ -1,4 +1,4 @@
-#------------------ENACTOR------------------–#
+#------------------AGENT------------------–#
 class Agent:
     def __init__(self, id: str, name: str):
         self._id = id

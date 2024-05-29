@@ -21,11 +21,11 @@ class Workflow(Node):
         
     def add_input(self, data: Data):
         data.set_consumer(self)
-        if data.is_input():
+        if data.is_input:
             self._inputs.append(data)
     def add_output(self, data: Data):
         data.set_producer(self)
-        if data.is_output():
+        if data.is_output:
             self._outputs.append(data)
     def add_task(self, task: 'Task'): 
         if self._tasks:
@@ -47,6 +47,22 @@ class Workflow(Node):
             'prov:label': self._name,
             'prov:type': 'prov:Activity'
         })
+        
+        for input in self._inputs:
+            if input is not None:
+                doc.entity(input._id, {
+                        'prov:label': input._name,
+                        'prov:type': 'prov:Entity'
+                })
+                doc.used(self._id, input._id)
+        for output in self._outputs:
+            if output is not None:
+                doc.entity(output._id, {
+                        'prov:label': output._name,
+                        'prov:type': 'prov:Entity'
+                })
+                doc.wasGeneratedBy(output._id, self._id)
+                
         # Add tasks as activities and agents as agents
         for task in self._tasks:
             doc.activity(task._id, task._start_time, task._end_time, {
@@ -96,8 +112,8 @@ class Workflow(Node):
                             'prov:label': data_item._name,
                             'prov:type': 'prov:Entity'
                     })
-                # doc.wasGeneratedBy(data_item._id, task._id)
-                doc.wasGeneratedBy(data_item._id, task._id)
+                    # doc.wasGeneratedBy(data_item._id, task._id)
+                    doc.wasGeneratedBy(data_item._id, task._id)
 
                 
             # Add wasInformedBy relation between tasks
