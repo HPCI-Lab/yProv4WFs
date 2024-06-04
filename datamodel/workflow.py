@@ -23,30 +23,41 @@ class Workflow(Node):
         data.set_consumer(self)
         if data.is_input:
             self._inputs.append(data)
+            
     def add_output(self, data: Data):
         data.set_producer(self)
         if data.is_output:
             self._outputs.append(data)
+            
     def add_task(self, task: 'Task'): 
         if self._tasks:
             last_task = self._tasks[-1]
             last_task.set_next(task)
             task.set_prev(last_task)
         self._tasks.append(task)
+        
     def get_task_by_id(self, id):
         for task in self._tasks:
             if task.id == id:
                 return task
         return None
+
+    
     
     def to_prov(self):
         doc = prov.ProvDocument()
         doc.set_default_namespace('http://anotherexample.org/')
+        doc.add_namespace('prov4wfs', 'http://example.org')
         
-        doc.activity(self._id, self._start_time, self._end_time,{
-            'prov:label': self._name,
-            'prov:type': 'prov:Activity'
-        })
+        if self._resource_cwl_uri is not None:
+            doc.activity(self._id, self._start_time, self._end_time,{
+                'prov:label': self._name,
+                'prov:type': 'prov:Activity',
+                'prov4wfs:level': self._level, 
+                'prov4wfs:engine': self._engineWMS,
+                'prov4wfs:status': self._status,
+                'prov4wfs:resource_uri': self._resource_cwl_uri,
+            })
         
         for input in self._inputs:
             if input is not None:
@@ -67,7 +78,9 @@ class Workflow(Node):
         for task in self._tasks:
             doc.activity(task._id, task._start_time, task._end_time, {
                 'prov:label': task._name,
-                'prov:type': 'prov:Activity'
+                'prov:type': 'prov:Activity',
+                'prov4wfs:status': task._status,
+                'prov4wfs:level': task._level,
                 })
             # Add wasStartedBy relation between task and workflow
             # doc.wasStartedBy(task._id, self._id, None)
@@ -122,123 +135,10 @@ class Workflow(Node):
                 doc.wasInformedBy(task._id, task._prev._id)
 
         return doc.serialize(format='json')
+    
     def prov_to_json(self):
         prov_dict = json.loads(self.to_prov())
         json_file_path = f'prov4wfs_{self._id}.json'
         with open(json_file_path, 'w') as f:
             json.dump(prov_dict, f, indent=4)
         return json_file_path
-
-    
-
-#     from datamodel.node import Node
-# from datamodel.data import Data
-# from datamodel.task import Task
-# import prov.model as prov
-# import json
-
-# #------------------WORKFLOW------------------–# 
-# class Workflow(Node):
-#     def __init__(self, id: str, name: str):
-#         super().__init__(id, name)
-#         self._inputs = []
-#         self._outputs = []
-#         self._tasks = []
-#         #self._tasks = {}
-
-#     def add_input(self, data: Data):
-#         data.set_consumer(self)
-#         if data.is_input():
-#             self._inputs.append(data)
-
-#     def add_output(self, data: Data):
-#         data.set_producer(self)
-#         if data.is_output():
-#            self._outputs.append(data)
-
-#     def add_task(self, task: 'Task'):
-#         if self._tasks:
-#             last_task_id = list(self._tasks.keys())[-1]
-#             last_task = self._tasks[last_task_id]
-#             last_task.set_target(task)
-#             task.set_source(last_task)
-#         self._tasks[task._id] = task
-
-#     def to_prov(self):
-#         doc = prov.ProvDocument()
-#         doc.set_default_namespace('http://anotherexample.org/')
-#         #to add namespaces
-#         #doc.add_namespace("dcterms", "http://purl.org/dc/terms/")
-#         #TODO: is it a valid anamespace??
-#         doc.add_namespace('prov4wfs', 'http://placeholder.org/prov4wfs') 
-
-#         # Add workflow as activity
-#         # doc.activity(identifier, startTime=None, endTime=None, other_attributes=None)
-#         doc.activity(self._id, self._start_time, self._end_time, {
-#             'prov:label': self._name,
-#             'prov:type': 'prov:Activity'#,
-#             # 'prov4wfs:input': json.dumps([input.to_dict() for input in self._inputs]),
-#             # 'prov4wfs:output': json.dumps([output.to_dict() for output in self._outputs]),
-#             # 'prov4wfs:tasks': json.dumps([task.to_dict() for task in self._tasks.values()])
-#         })
-#         # Add tasks as activities and enactors as agents
-#         for task in self._tasks:
-#             doc.activity(task._id, task._start_time, task._end_time, {
-#                 'prov:label': task._name,
-#                 'prov:type': 'prov:Activity' #,
-#                 # 'prov4wfs:input': json.dumps(task._inputs),
-#                 # 'prov4wfs:output': json.dumps(task._outputs),
-#                 # 'prov4wfs:source': json.dumps(task._source),
-#                 # 'prov4wfs:target': json.dumps(task._target)
-#                 })
-#             if task._enactor is not None:
-#                 doc.agent(task._enactor._id, {
-#                     'prov:label': task._enactor._name,
-#                     'prov:type': 'prov:Agent'
-#                 })
-
-#                 # Add wasAttributedTo relations between enactor and data items
-#                 for data_item in task._enactor._attributed_to:
-#                     doc.entity(data_item._id, {
-#                         'prov:label': data_item._name,
-#                         'prov:type': 'prov:Entity',
-#                         'prov4wfs:producer': data_item._producer, 
-#                         'prov4wfs:consumer': data_item._consumer
-#                     })
-#                     doc.wasAttributedTo(data_item._id, task._enactor._id)
-
-#                 # Add actedOnBehalfOf relations between enactor and the enactors it acted for
-#                 if task._enactor._acted_for is not None:
-#                     doc.agent(task._enactor._acted_for._id, {
-#                         'prov:label': task._enactor._acted_for._name,
-#                         'prov:type': 'prov:Agent'
-#                     })
-#                     doc.actedOnBehalfOf(task._enactor._id, task._enactor._acted_for._id)
-
-#                 # Add wasAssociatedWith relation between task and enactor
-#                 doc.wasAssociatedWith(task._id, task._enactor._id)
-
-#             # Add wasInformedBy relation between tasks
-#             if task._source is not None:
-#                 doc.wasInformedBy(task._id, task._source._id)
-
-#             # Add used and wasGeneratedBy relations for inputs and outputs
-#             for data_item in task._inputs:
-#                 doc.entity(data_item._id, {
-#                         'prov:label': data_item._name,
-#                         'prov:type': 'prov:Entity',
-#                         'prov4wfs:producer': data_item._producer, 
-#                         'prov4wfs:consumer': data_item._consumer
-#                 })
-#                 doc.used(task._id, data_item._id)
-#             for data_item in task._outputs:
-#                 doc.entity(data_item._id, {
-#                         'prov:label': data_item._name,
-#                         'prov:type': 'prov:Entity',
-#                         'prov4wfs:producer': data_item._producer, 
-#                         'prov4wfs:consumer': data_item._consumer
-#                 })
-#             doc.wasGeneratedBy(data_item._id, task._id)
-
-#         return doc.serialize(format='json')
-    
