@@ -1,4 +1,4 @@
-## PROV4WFS
+## PROV4WFs
 Prov4WFs is a service to track the provenance of a workflow run via a Workflow Management System (WMS) at run time. It is compliant with the W3C PROV standard.
 
 It allows scientists or users in general to manage the provenance information collected during the execution. It focuses on a whole workflow and on specific steps inside it.
