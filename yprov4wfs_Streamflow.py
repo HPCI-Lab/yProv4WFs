@@ -19,7 +19,7 @@ from datamodel.data import Data, FileType
 from datamodel.agent import Agent
 
 
-class Prov4WfsExecutor(StreamFlowExecutor):
+class yProv4WfsExecutor(StreamFlowExecutor):
     def __init__(self, workflow: Executor):
         super().__init__(workflow)
         self.prov_workflow = None

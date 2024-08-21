@@ -1,4 +1,4 @@
-## PROV4WFs - StreamFlow
+## yPeov4WFs - StreamFlow
 
 Necessary steps to work with Prov4WFs in StreamFlow:
 
@@ -17,9 +17,9 @@ git clone https://github.com/alpha-unito/streamflow.git
   Completely delete the content and replace with the following code:
 
   ```bash
-  from prov4wfs.prov4wfs_Streamflow_fromdb import PROW4WFSProvenanceManager
+  from yProv4wfs.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
   
-  prov_classes = {"run_crate": {"cwl": PROW4WFSProvenanceManager}}
+  prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
   ```
 
 - Create your workflow following StreamFlow instructions

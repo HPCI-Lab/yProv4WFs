@@ -17,7 +17,7 @@ from datamodel.data import Data, FileType
 from datamodel.agent import Agent
 
 
-class PROV4WFSProvenanceManager(ProvenanceManager):
+class yProv4WFsProvenanceManager(ProvenanceManager):
     def __init__(
         self,
         context: StreamFlowContext,
@@ -163,5 +163,5 @@ class PROV4WFSProvenanceManager(ProvenanceManager):
                         archive.write(src, dst)
                 else:
                     logger.warning(f"File {src} does not exist.")
-        print(f"Successfully created PROV4WFS archive at {path}")
+        print(f"Successfully created yProv4WFs archive at {path}")
         

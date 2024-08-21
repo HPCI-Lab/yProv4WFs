@@ -34,5 +34,5 @@ The second line contains the *workflow_id*, in our example:
 
 Possible expected output of the streamflow prov commmand:
 ```console
-Successfully created PROV4WFS archive at /code/examples/try1/workflow_esempio/7838648e-a93d-4345-b937-bd2290dcbf0d.zip
+Successfully created yProv4WFs archive at /code/examples/try1/workflow_esempio/7838648e-a93d-4345-b937-bd2290dcbf0d.zip
 ```
