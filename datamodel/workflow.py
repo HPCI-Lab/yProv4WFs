@@ -35,10 +35,6 @@ class Workflow(Node):
             self._outputs.append(data)
             
     def add_task(self, task: 'Task'): 
-        if self._tasks:
-            last_task = self._tasks[-1]
-            last_task.set_next(task)
-            task.set_prev(last_task)
         self._tasks.append(task)
         
     def get_task_by_id(self, id):
@@ -143,8 +139,9 @@ class Workflow(Node):
                         doc['wasGeneratedBy'][f'{str(uuid4())}'] = {'prov:entity': data_item._id, 'prov:activity': task._id}
 
                     if task._prev is not None:
-                        doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': task._prev._id}
-
+                        for prev_task in task._prev:
+                            doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': prev_task._id}
+                            
             # Helper function to remove empty lists from the dictionary
             def remove_empty_lists(d):
                 if isinstance(d, dict):
