@@ -31,4 +31,4 @@ git clone https://github.com/cylc/cylc-flow.git
   or any other command line, depending on the cylc/flow version you are using.<br>
   Wait till the workflow's execution is concluded.
 
-- The expected output is provided in the *cylc-run* directory, under the *workflow_name/try_number* folder, where you can find the tracked provenance as a json file (yProv4WFs.json).
+- The expected output is provided in the *cylc-run* directory, under the *workflow_name/run_number* folder, where you can find the tracked provenance as a json file (yProv4WFs.json).
