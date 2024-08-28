@@ -1,6 +1,6 @@
 ## yProv4WFs - StreamFlow
 
-Necessary steps to work with Prov4WFs in StreamFlow:
+Necessary steps to work with yProv4WFs in StreamFlow:
 
 - Clone StreamFlow repository
 ```bash

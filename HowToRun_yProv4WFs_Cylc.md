@@ -1,6 +1,6 @@
 ## yProv4WFs - Cylc
 
-Necessary steps to work with Prov4WFs in Cylc:
+Necessary steps to work with yProv4WFs in Cylc:
 
 - Clone Cylc repository
 ```bash
@@ -20,7 +20,7 @@ git clone https://github.com/cylc/cylc-flow.git
   
   ```
 
-- Create your workflow following Cylc instructions
+- Create your workflow following Cylc instructions <br>
   (You can find some examples in the Cylc documentation: 
   https://cylc.github.io/cylc-doc/stable/html/workflow-design-guide/index.html)
 
@@ -28,6 +28,7 @@ git clone https://github.com/cylc/cylc-flow.git
   ```bash
   cylc vip
   ```
-  or any other command line, depending on the cylc/flow version you are using.
+  or any other command line, depending on the cylc/flow version you are using.<br>
+  Wait till the workflow's execution is concluded.
 
 - The expected output is provided in the *cylc-run* directory, under the *workflow_name/try_number* folder, where you can find the tracked provenance as a json file (yProv4WFs.json).
