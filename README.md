@@ -7,8 +7,8 @@ yProv4WFs is a [University of Trento](https://www.unitn.it) project, that extend
 
 Currently, yProv4WFs is developed to be run on the following Workflow Management Systems:
 -  Streamflow (https://github.com/HPCI-Lab/prov4wfs/blob/main/HowToRun_Prov4WFs_Streamflow.md)
+-  Cylc (https://github.com/HPCI-Lab/prov4wfs/blob/main/HowToRun_Prov4WFs_Cylc.md)
 <!---
--  Cylc (
 -  ecFlow (
 -->
 

@@ -1,4 +1,4 @@
-## yPeov4WFs - StreamFlow
+## yProv4WFs - StreamFlow
 
 Necessary steps to work with Prov4WFs in StreamFlow:
 

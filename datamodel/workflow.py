@@ -4,7 +4,6 @@ from datamodel.task import Task
 
 from pathlib import Path
 from uuid import uuid4
-# import prov.model as prov
 import traceback
 import json
 import os
@@ -34,7 +33,7 @@ class Workflow(Node):
         if data.is_output:
             self._outputs.append(data)
             
-    def add_task(self, task: 'Task'): 
+    def add_task(self, task: Task): 
         self._tasks.append(task)
         
     def get_task_by_id(self, id):
@@ -62,17 +61,17 @@ class Workflow(Node):
                 'wasInformedBy': {}
             }
 
+            doc['activity'][self._id] = {
+                'prov:startTime': self._start_time,
+                'prov:endTime': self._end_time,
+                'prov:label': self._name,
+                'prov:type': 'prov:Activity',
+                'yprov4wfs:level': self._level,
+                'yprov4wfs:engine': self._engineWMS,
+                'yprov4wfs:status': self._status,
+            }
             if self._resource_cwl_uri is not None:
-                doc['activity'][self._id] = {
-                    'prov:startTime': self._start_time,
-                    'prov:endTime': self._end_time,
-                    'prov:label': self._name,
-                    'prov:type': 'prov:Activity',
-                    'yprov4wfs:level': self._level,
-                    'yprov4wfs:engine': self._engineWMS,
-                    'yprov4wfs:status': self._status,
-                    'yprov4wfs:resource_uri': self._resource_cwl_uri
-                }
+                doc['activity'][self._id]['yprov4wfs:resource_uri'] = self._resource_cwl_uri
 
             for input in self._inputs:
                 if input is not None:
@@ -188,7 +187,9 @@ class Workflow(Node):
             print(f"Error: {e} ")
             traceback.print_exc()
             return None
-    
+
+# to_prov function with dependences to prov.model library
+# import prov.model as prov   
     # def to_prov(self):
     #     doc = prov.ProvDocument()
     #     doc.set_default_namespace('http://anotherexample.org/')
