@@ -11,7 +11,7 @@ git clone https://github.com/alpha-unito/streamflow.git
 - Add StreamFlow folder into your own project
 -->
 
-- Follow StreamFlow documentation for running your project using Docker or Kubernetes https://github.com/alpha-unito/streamflow/blob/master/README.md
+- Follow [StreamFlow documentation](https://github.com/alpha-unito/streamflow/blob/master/README.md) for running your project using Docker or Kubernetes 
 
 - Go into StreamFlow folder locally and modify file /streamflow/provenance/__init__.py
   Completely delete the content and replace with the following code:
