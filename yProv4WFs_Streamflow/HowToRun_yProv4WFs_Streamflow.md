@@ -35,7 +35,7 @@ git clone https://github.com/alpha-unito/streamflow.git
   streamflow prov <"workflow_id">
   ```
 
-  For more information on how to get the workflow_id in StreamFlow follow this link
-  https://github.com/HPCI-Lab/prov4wfs/blob/main/yProv4WFs_Streamflow/HowToGet_StreamFlow_workflowID.md
+  For more information on how to get the workflow_id in StreamFlow follow this
+  [link](https://github.com/HPCI-Lab/yProv4WFs/blob/main/yProv4WFs_Streamflow/HowToGet_StreamFlow_workflowID.md)
 
 - The expected output is provided as a zip file in which to find the tracked provenance as a json file.
