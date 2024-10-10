@@ -7,6 +7,22 @@ Necessary steps to work with yProv4WFs in StreamFlow:
 git clone https://github.com/alpha-unito/streamflow.git
 ```
  
+- Clone yProv4WFs repository:
+  1. Installing by downloading the repository:
+    * ```bash
+      cd /path/to/your/project
+      ```
+    * ```bash
+      pip install .
+      ```
+  2. Installing from a GitHub Repository:
+    * ```bash
+      pip install git+https://github.com/HPCI-Lab/yProv4WFs.git
+      ```
+    * verify installation: 
+      ```bash
+      pip show yprov4wfs
+      ```
 <!--
 - Add StreamFlow folder into your own project
 -->
@@ -17,8 +33,11 @@ git clone https://github.com/alpha-unito/streamflow.git
   Completely delete the content and replace with the following code:
 
   ```bash
+<!--
   from yProv4wfs.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
-  
+-->
+  from yprov4wfs.yProv4WFs_Streamflow.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
+
   prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
   ```
 

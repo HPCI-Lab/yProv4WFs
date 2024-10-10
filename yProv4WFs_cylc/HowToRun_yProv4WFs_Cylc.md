@@ -2,10 +2,26 @@
 
 Necessary steps to work with yProv4WFs in Cylc:
 
-- Clone Cylc repository
+- Clone Cylc repository (inside conda environment preferably):
 ```bash
 git clone https://github.com/cylc/cylc-flow.git
 ```
+- Clone yProv4WFs repository (inside conda environment preferably):
+  1. Installing by downloading the repository:
+    * ```bash
+      cd /path/to/your/project
+      ```
+    * ```bash
+      pip install .
+      ```
+  2. Installing from a GitHub Repository:
+    * ```bash
+      pip install git+https://github.com/HPCI-Lab/yProv4WFs.git
+      ```
+    * verify installation: 
+      ```bash
+      pip show yprov4wfs
+      ```
 
 - Follow Cylc documentation for running your project https://github.com/cylc/cylc-flow/blob/master/README.md
 
@@ -16,8 +32,7 @@ git clone https://github.com/cylc/cylc-flow.git
   ```
   With the following code:
   ```bash
-  from yProv4wfs.yprov4wfs_Cylc import Scheduler, SchedulerError
-  
+  from yprov4wfs.yProv4WFs_cylc.yprov4wfs_Cylc import Scheduler, SchedulerError
   ```
 
 - Create your workflow following Cylc instructions <br>
