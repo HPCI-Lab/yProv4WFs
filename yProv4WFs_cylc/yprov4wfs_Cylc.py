@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
-"""Cylc scheduler serve + provenance (yProv4WFs)."""
+"""Cylc scheduler + provenance (yProv4WFs)."""
 
 import asyncio
 from collections import deque
