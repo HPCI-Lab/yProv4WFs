@@ -1,12 +1,14 @@
 from setuptools import setup, find_packages
 
+def parse_requirements(filename):
+    with open(filename, 'r') as file:
+        return [line.strip() for line in file if line.strip() and not line.startswith('#')]
+
 setup(
     name='yprov4wfs',                    
     version='0.1.0',                     
     packages=find_packages(),           
-    install_requires=[                   
-                                         
-    ],
+    install_requires=parse_requirements('requirements.txt'),
     author='Carolina Sopranzetti',
     author_email='',                  
     description='A module for tracking the provenance of a workflow using a Workflow Management System.',  
