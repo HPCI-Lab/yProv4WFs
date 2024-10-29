@@ -3,7 +3,7 @@ requires = ["setuptools>=42"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "yprov4wfs"
+name = "yProv4WFs"
 version = "0.0.2"
 authors = [
   { name="Carolina Sopranzetti"},
