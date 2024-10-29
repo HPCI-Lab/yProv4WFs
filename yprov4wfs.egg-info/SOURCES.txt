@@ -8,6 +8,10 @@ datamodel/data.py
 datamodel/node.py
 datamodel/task.py
 datamodel/workflow.py
+yProv4WFs.egg-info/PKG-INFO
+yProv4WFs.egg-info/SOURCES.txt
+yProv4WFs.egg-info/dependency_links.txt
+yProv4WFs.egg-info/top_level.txt
 yProv4WFs_Streamflow/__init__.py
 yProv4WFs_Streamflow/yprov4wfs_Streamflow.py
 yProv4WFs_Streamflow/yprov4wfs_Streamflow_fromdb.py
