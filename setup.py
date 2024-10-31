@@ -1,8 +1,8 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='yProv4WFs',                    
-    version='0.0.3',                     
+    name='yprov4wfs',                    
+    version='0.0.4',                     
     packages=find_packages(),           
     install_requires=[],
     author='Carolina Sopranzetti',                 
