@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
     name='yprov4wfs',                    
     version='0.0.4.1',                     
-    ackages(packages=find_packages(include=["yprov4wfs", "yprov4wfs.*"]), 
+    packages=find_packages(include=["yprov4wfs", "yprov4wfs.*"]), 
     include_package_data=True,           
     install_requires=[],
     author='Carolina Sopranzetti',                 
