@@ -7,15 +7,23 @@ Necessary steps to work with yProv4WFs in StreamFlow:
 git clone https://github.com/alpha-unito/streamflow.git
 ```
  
-- Clone yProv4WFs repository:
-  1. Installing by downloading the repository:
+- Using yProv4WFs library:
+  1. Installing using pip:
+    * ```bash
+      pip install yprov4wfs
+      ```
+    * verify installation: 
+      ```bash
+      pip show yprov4wfs
+      ```
+  2. Installing by downloading the repository:
     * ```bash
       cd /path/to/your/project
       ```
     * ```bash
       pip install .
       ```
-  2. Installing from a GitHub Repository:
+  3. Installing from a GitHub Repository:
     * ```bash
       pip install git+https://github.com/HPCI-Lab/yProv4WFs.git
       ```
@@ -55,6 +63,6 @@ git clone https://github.com/alpha-unito/streamflow.git
   ```
 
   For more information on how to get the workflow_id in StreamFlow follow this
-  [link](https://github.com/HPCI-Lab/yProv4WFs/blob/main/yProv4WFs_Streamflow/HowToGet_StreamFlow_workflowID.md)
+  [link](https://github.com/HPCI-Lab/yProv4WFs/blob/main/yprov4wfs/yProv4WFs_Streamflow/HowToGet_StreamFlow_workflowID.md)
 
 - The expected output is provided as a zip file in which to find the tracked provenance as a json file.

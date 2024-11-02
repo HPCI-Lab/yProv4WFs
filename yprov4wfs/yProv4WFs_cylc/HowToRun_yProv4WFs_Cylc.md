@@ -6,15 +6,23 @@ Necessary steps to work with yProv4WFs in Cylc:
 ```bash
 git clone https://github.com/cylc/cylc-flow.git
 ```
-- Clone yProv4WFs repository (inside conda environment preferably):
-  1. Installing by downloading the repository:
+- Using yProv4WFs library (inside conda environment preferably):
+  1. Installing using pip:
+    * ```bash
+      pip install yprov4wfs
+      ```
+    * verify installation: 
+      ```bash
+      pip show yprov4wfs
+      ```
+  2. Installing by downloading the repository:
     * ```bash
       cd /path/to/your/project
       ```
     * ```bash
       pip install .
       ```
-  2. Installing from a GitHub Repository:
+  3. Installing from a GitHub Repository:
     * ```bash
       pip install git+https://github.com/HPCI-Lab/yProv4WFs.git
       ```
