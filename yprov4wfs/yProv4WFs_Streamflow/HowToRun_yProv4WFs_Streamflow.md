@@ -39,11 +39,10 @@ git clone https://github.com/alpha-unito/streamflow.git
 
 - Go into StreamFlow folder locally and modify file /streamflow/provenance/__init__.py
   Completely delete the content and replace with the following code:
-
-  ```bash
 <!--
   from yProv4wfs.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
 -->
+  ```bash
   from yprov4wfs.yProv4WFs_Streamflow.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
 
   prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
