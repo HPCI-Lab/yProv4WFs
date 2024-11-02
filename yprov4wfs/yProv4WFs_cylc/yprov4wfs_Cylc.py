@@ -755,8 +755,7 @@ class Scheduler:
                
           
             self.prov_workflow._end_time = end
-            _, status_msg = get_workflow_status(self)
-            self.prov_workflow._status = status_msg
+            self.prov_workflow._status = get_workflow_status(self)
             
             execution_wf = {
                 "id": self.prov_workflow._id,
