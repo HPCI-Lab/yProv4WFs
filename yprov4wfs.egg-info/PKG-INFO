@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: yprov4wfs
-Version: 0.0.4.2
+Version: 0.0.4.3
 Summary: A module for tracking the provenance of a workflow using a Workflow Management System.
 Home-page: https://github.com/HPCI-Lab/yProv4WFs
 Author: Carolina Sopranzetti

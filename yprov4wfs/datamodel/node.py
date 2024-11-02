@@ -1,5 +1,5 @@
 from datetime import datetime
-from datamodel.agent import Agent
+from yprov4wfs.datamodel.agent import Agent
 
 #------------------NODE------------------–#
 class Node:

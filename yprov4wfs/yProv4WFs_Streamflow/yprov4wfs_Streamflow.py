@@ -13,10 +13,10 @@ from streamflow.core.exception import WorkflowExecutionException
 from streamflow.workflow.executor import StreamFlowExecutor
 from streamflow.workflow.step import ExecuteStep
 
-from datamodel.workflow import Workflow
-from datamodel.task import Task
-from datamodel.data import Data, FileType
-from datamodel.agent import Agent
+from yprov4wfs.datamodel.workflow import Workflow
+from yprov4wfs.datamodel.task import Task
+from yprov4wfs.datamodel.data import Data, FileType
+from yprov4wfs.datamodel.agent import Agent
 
 
 class yProv4WfsExecutor(StreamFlowExecutor):

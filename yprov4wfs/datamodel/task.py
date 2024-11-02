@@ -1,5 +1,5 @@
-from datamodel.node import Node
-from datamodel.data import Data
+from yprov4wfs.datamodel.node import Node
+from yprov4wfs.datamodel.data import Data
 
 #------------------TASK------------------–#
 class Task(Node):

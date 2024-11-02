@@ -1,6 +1,6 @@
-from datamodel.node import Node
-from datamodel.data import Data
-from datamodel.task import Task
+from yprov4wfs.datamodel.node import Node
+from yprov4wfs.datamodel.data import Data
+from yprov4wfs.datamodel.task import Task
 
 from pathlib import Path
 from uuid import uuid4

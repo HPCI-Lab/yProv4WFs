@@ -165,10 +165,10 @@ if TYPE_CHECKING:
     from cylc.flow.network.resolvers import TaskMsg
 
 
-from datamodel.workflow import Workflow
-from datamodel.task import Task
-from datamodel.data import Data, FileType
-from datamodel.agent import Agent
+from yprov4wfs.datamodel.workflow import Workflow
+from yprov4wfs.datamodel.task import Task
+from yprov4wfs.datamodel.data import Data, FileType
+from yprov4wfs.datamodel.agent import Agent
 
 
 class SchedulerStop(CylcError):

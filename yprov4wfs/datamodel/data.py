@@ -1,5 +1,5 @@
 import os
-from datamodel.agent import Agent
+from yprov4wfs.datamodel.agent import Agent
 
 #------------------FileType------------------–#
 class FileType:
