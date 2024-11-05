@@ -15,40 +15,40 @@ Necessary steps to work with yProv4WFs in Cylc:
         conda install pip
         ```
     3. clone cylc-flow repository
-      ```bash
-      git clone https://github.com/cylc/cylc-flow.git
-      ```
+      * ```bash
+        git clone https://github.com/cylc/cylc-flow.git
+        ```
     4. modify file /cylc-flow/cylc/flow/scheduler_cli.py
-      Replace this import:
-      ```bash
-      from cylc.flow.scheduler import Scheduler, SchedulerError
-      ```
-      With the following one:
-      ```bash
-      from yprov4wfs.yProv4WFs_cylc.yprov4wfs_Cylc import Scheduler, SchedulerError
-      ```
+        Replace this import:
+        ```bash
+        from cylc.flow.scheduler import Scheduler, SchedulerError
+        ```
+        With the following one:
+        ```bash
+        from yprov4wfs.yProv4WFs_cylc.yprov4wfs_Cylc import Scheduler, SchedulerError
+        ```
     5. in the cylc-flow directory 
-      ```bash
-      pip install .
-      ```
+        ```bash
+        pip install .
+        ```
   - outside conda environment [not recommented]
     1. In desirefd folder
-      ```bash
-      git clone https://github.com/cylc/cylc-flow.git
-      ```
+        ```bash
+        git clone https://github.com/cylc/cylc-flow.git
+        ```
     2. the path where the git clone was done: replace [...] with [your own path]
-      ```bash
-      pip install -e /.../cylc-flow
-      ```
+        ```bash
+        pip install -e /.../cylc-flow
+        ```
     3. modify file /cylc-flow/cylc/flow/scheduler_cli.py
-      Replace this import:
-      ```bash
-      from cylc.flow.scheduler import Scheduler, SchedulerError
-      ```
-      With the following one:
-      ```bash
-      from yprov4wfs.yProv4WFs_cylc.yprov4wfs_Cylc import Scheduler, SchedulerError
-      ```
+        Replace this import:
+        ```bash
+        from cylc.flow.scheduler import Scheduler, SchedulerError
+        ```
+        With the following one:
+        ```bash
+        from yprov4wfs.yProv4WFs_cylc.yprov4wfs_Cylc import Scheduler, SchedulerError
+        ```
 - Using yProv4WFs library (inside conda environment preferably):
   1. Installing using pip:
     * ```bash
