@@ -32,7 +32,7 @@ Necessary steps to work with yProv4WFs in Cylc:
         pip install .
         ```
   - outside conda environment [not recommented]
-    1. In desirefd folder
+    1. In desired folder
         ```bash
         git clone https://github.com/cylc/cylc-flow.git
         ```
