@@ -1,5 +1,9 @@
 #------------------AGENT------------------–#
 class Agent:
+    """
+    Represents an agent (compliant with W3C-PROV) with an ID and name, and maintains relationships
+    with other agents it acts for, is attributed to, or is associated with.
+    """
     def __init__(self, id: str, name: str):
         self._id = id
         self._name = name

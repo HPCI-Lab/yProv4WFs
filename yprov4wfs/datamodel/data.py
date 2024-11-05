@@ -24,6 +24,10 @@ class FileType:
 
 #------------------DATA------------------–#
 class Data:
+    """
+    Represents a data entity with an ID, name and maintains attributes such as type, producer, consumer,
+    and associated agent. It also tracks whether the data is used as input or outputs.
+    """
     def __init__(self, id: str, name: str):
         self._id = id
         self._name = name

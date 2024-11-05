@@ -3,9 +3,52 @@
 Necessary steps to work with yProv4WFs in Cylc:
 
 - Clone Cylc repository (inside conda environment preferably):
-```bash
-git clone https://github.com/cylc/cylc-flow.git
-```
+  - using conda:
+    1. create a directoty and access it
+      * ```bash
+        mkdir <dir_name>
+        cd <dir_name>
+        ```
+    2. create a conda environment and install pip
+      * ```bash
+        conda create -n cylc
+        conda install pip
+        ```
+    3. clone cylc-flow repository
+      ```bash
+      git clone https://github.com/cylc/cylc-flow.git
+      ```
+    4. modify file /cylc-flow/cylc/flow/scheduler_cli.py
+      Replace this import:
+      ```bash
+      from cylc.flow.scheduler import Scheduler, SchedulerError
+      ```
+      With the following one:
+      ```bash
+      from yprov4wfs.yProv4WFs_cylc.yprov4wfs_Cylc import Scheduler, SchedulerError
+      ```
+    5. in the cylc-flow directory 
+      ```bash
+      pip install .
+      ```
+  - outside conda environment [not recommented]
+    1. In desirefd folder
+      ```bash
+      git clone https://github.com/cylc/cylc-flow.git
+      ```
+    2. the path where the git clone was done: replace [...] with [your own path]
+      ```bash
+      pip install -e /.../cylc-flow
+      ```
+    3. modify file /cylc-flow/cylc/flow/scheduler_cli.py
+      Replace this import:
+      ```bash
+      from cylc.flow.scheduler import Scheduler, SchedulerError
+      ```
+      With the following one:
+      ```bash
+      from yprov4wfs.yProv4WFs_cylc.yprov4wfs_Cylc import Scheduler, SchedulerError
+      ```
 - Using yProv4WFs library (inside conda environment preferably):
   1. Installing using pip:
     * ```bash
@@ -32,16 +75,6 @@ git clone https://github.com/cylc/cylc-flow.git
       ```
 
 - Follow Cylc documentation for running your project https://github.com/cylc/cylc-flow/blob/master/README.md
-
-- Go into Cylc folder locally and modify file /cylc/flow/scheduler_cli.py
-  Replace this import:
-  ```bash
-  from cylc.flow.scheduler import Scheduler, SchedulerError
-  ```
-  With the following code:
-  ```bash
-  from yprov4wfs.yProv4WFs_cylc.yprov4wfs_Cylc import Scheduler, SchedulerError
-  ```
 
 - Create your workflow following Cylc instructions <br>
   (You can find some examples in the Cylc documentation: 

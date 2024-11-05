@@ -3,6 +3,9 @@ from yprov4wfs.datamodel.agent import Agent
 
 #------------------NODE------------------–#
 class Node:
+    """
+    Represents a Node in a Workflow Management Syste,
+    """
     def __init__(self, id: str, name: str):
         self._id = id
         self._name = name

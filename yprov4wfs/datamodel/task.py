@@ -2,6 +2,24 @@ from yprov4wfs.datamodel.node import Node
 from yprov4wfs.datamodel.data import Data
 
 #------------------TASK------------------–#
+"""
+Task class represents a unit of work in a workflow, inheriting from Node.
+Attributes:
+    _inputs (list): List of Data objects that are inputs to the task.
+    _outputs (list): List of Data objects that are outputs from the task.
+    _prev (list): List of preceding Task objects.
+    _next (list): List of succeeding Task objects.
+Methods:
+    add_input(data: Data):
+        Adds a Data object to the task's inputs if it is marked as an input.
+    add_output(data: Data):
+        Adds a Data object to the task's outputs if it is marked as an output.
+    set_prev(prev: 'Task'):
+        Sets a preceding Task object.
+    set_next(next: 'Task'):
+        Sets a succeeding Task object.
+"""
+
 class Task(Node):
     def __init__(self, id: str, name: str):
         super().__init__(id, name)

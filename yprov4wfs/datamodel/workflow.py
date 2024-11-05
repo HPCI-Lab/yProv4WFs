@@ -9,6 +9,25 @@ import json
 import os
 
 #------------------WORKFLOW------------------–# 
+"""
+Workflow class represents a workflow in the system, inheriting from Node.
+Methods:
+    __init__(id: str, name: str):
+        Initializes a new instance of the Workflow class.
+    add_input(data: Data):
+        Adds an input Data object to the workflow.
+    add_output(data: Data):
+        Adds an output Data object to the workflow.
+    add_task(task: Task):
+        Adds a Task object to the workflow.
+    get_task_by_id(id: str):
+        Retrieves a Task object by its ID.
+    to_prov():
+        Converts the workflow to a PROV document in JSON format without dependencies on the prov.model library.
+    prov_to_json(directory_path: str or None):
+        Serializes the workflow to a JSON file in the specified directory or the current directory if no path is provided.
+"""
+
 class Workflow(Node):
     def __init__(self, id: str, name: str):
         super().__init__(id, name)
