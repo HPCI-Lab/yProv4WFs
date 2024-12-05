@@ -38,3 +38,6 @@ class Node:
 
     def add_description(self, description: str):
         self._description = description
+        
+    def set_id(self, id: str):
+        self._id = id

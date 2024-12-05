@@ -18,11 +18,11 @@
 import asyncio
 from collections import deque
 from contextlib import suppress
-from datetime import datetime
 import os
 from pathlib import Path
 from queue import Empty, Queue
 from shlex import quote
+import signal
 from socket import gaierror
 from subprocess import DEVNULL, PIPE, Popen
 import sys
@@ -91,7 +91,7 @@ from cylc.flow.parsec.OrderedDict import DictTree
 from cylc.flow.parsec.exceptions import ParsecError
 from cylc.flow.parsec.validate import DurationFloat
 from cylc.flow.pathutil import (
-    get_workflow_run_pub_db_path,
+    get_workflow_run_pub_db_path, #yprov4wfs
     get_workflow_name_from_id,
     get_workflow_run_config_log_dir,
     get_workflow_run_dir,
@@ -107,7 +107,6 @@ from cylc.flow.platforms import (
     get_platform,
     is_platform_with_target_in_list,
 )
-from cylc.flow.rundb import CylcWorkflowDAO
 from cylc.flow.profiler import Profiler
 from cylc.flow.resources import get_resources
 from cylc.flow.simulation import sim_time_check
@@ -123,20 +122,14 @@ from cylc.flow.task_remote_mgr import (
     REMOTE_INIT_DONE,
     REMOTE_INIT_FAILED,
 )
-from cylc.flow.workflow_status import get_workflow_status, WorkflowStatus
-from cylc.flow import workflow_files, task_state
 from cylc.flow.task_state import (
-    TASK_STATUSES_ACTIVE,
-    TASK_STATUSES_NEVER_ACTIVE,
+    TASK_STATUS_FAILED,
     TASK_STATUS_PREPARING,
     TASK_STATUS_RUNNING,
     TASK_STATUS_SUBMITTED,
     TASK_STATUS_WAITING,
-    TASK_STATUS_FAILED,
-    TASK_STATUS_SUCCEEDED,
-    TASK_STATUSES_FINAL,
-    TASK_STATUSES_SUCCESS,
-    TASK_STATUSES_FAILURE,
+    TASK_STATUSES_ACTIVE,
+    TASK_STATUSES_NEVER_ACTIVE,
 )
 from cylc.flow.taskdef import TaskDef
 from cylc.flow.templatevars import eval_var
@@ -152,24 +145,28 @@ from cylc.flow.workflow_db_mgr import WorkflowDatabaseManager
 from cylc.flow.workflow_events import WorkflowEventHandler
 from cylc.flow.workflow_status import AutoRestartMode, RunMode, StopMode
 from cylc.flow.xtrigger_mgr import XtriggerManager
-from cylc.flow.task_job_logs import get_task_job_job_log
-from cylc.flow.rundb import CylcWorkflowDAO
-from cylc.flow.scripts.graph import _get_graph_nodes_edges, get_config
 
 if TYPE_CHECKING:
+    from optparse import Values
+
     # BACK COMPAT: typing_extensions.Literal
     # FROM: Python 3.7
     # TO: Python 3.8
     from typing_extensions import Literal
-    from optparse import Values
+
     from cylc.flow.network.resolvers import TaskMsg
+    from cylc.flow.task_proxy import TaskProxy
 
-
+# yprov4wfs imports
 from yprov4wfs.datamodel.workflow import Workflow
 from yprov4wfs.datamodel.task import Task
 from yprov4wfs.datamodel.data import Data, FileType
 from yprov4wfs.datamodel.agent import Agent
-
+from datetime import datetime
+from cylc.flow.rundb import CylcWorkflowDAO
+from cylc.flow.workflow_status import get_workflow_status
+from cylc.flow.task_job_logs import get_task_job_job_log
+from cylc.flow.scripts.graph import _get_graph_nodes_edges, get_config
 
 class SchedulerStop(CylcError):
     """Scheduler normal stop."""
@@ -246,7 +243,7 @@ class Scheduler:
     cylc_config: DictTree  # [scheduler] config
     template_vars: Dict[str, Any]
 
-    # tcp / zmq                                                                    
+    # tcp / zmq
     server: WorkflowRuntimeServer
 
     # Note: attributes without a default must come before those with defaults
@@ -284,7 +281,7 @@ class Scheduler:
     count: int = 0
 
     time_next_kill: Optional[float] = None
-    
+
     def __init__(self, id_: str, options: 'Values') -> None:
         # flow information
         self.runtime_data = {} # dictionary to store runtime data for provenance
@@ -642,54 +639,72 @@ class Scheduler:
                     f'Stop point: {self.config.stop_point}',
                     extra=RotatingLogFileHandler.header_extra
                 )
-    
-    # task status for task provenance (yProv4WFs)
-    def get_task_status(self, status: task_state) -> str:
-        if status == 0:
-            return "succeded"
-        else: 
-            return "running"
-            
+
     # task information for task provenance (yProv4WFs)
-    async def get_task_times(self, workflow_id):
-        """Retrieve time_run, time_run_exit, and run_status for each task and cycle."""
+    async def get_task_infos(self, workflow_id):
+        """Retrieve detailed task information including time_run, time_run_exit, run_status, and related state details for each task and cycle."""
         query = """
-            SELECT
-                name,
-                cycle,
-                submit_num,
-                time_run,
-                time_run_exit,
-                run_status
-            FROM
+            SELECT 
+                task_jobs.name, 
+                task_jobs.cycle, 
+                task_jobs.submit_num, 
+                task_jobs.time_run, 
+                task_jobs.time_run_exit, 
+                task_jobs.platform_name, 
+                task_jobs.job_id,
+                task_jobs.flow_nums,
+                task_states.status, 
+                task_states.is_manual_submit
+            FROM 
                 task_jobs
-            WHERE
-                run_status = 0
+            INNER JOIN 
+                task_states 
+            ON 
+                task_jobs.name = task_states.name
+                AND task_jobs.cycle = task_states.cycle
+                AND task_jobs.submit_num = task_states.submit_num
+                AND task_jobs.flow_nums = task_states.flow_nums
         """
         
         with CylcWorkflowDAO(get_workflow_run_pub_db_path(workflow_id), is_public=True) as dao:
             results = list(dao.connect().execute(query))
         
-        task_times = {}
+        task_info = {}
         for row in results:
-            task = row[0]
+            name = row[0]
             point = row[1]
             submit_num = row[2]
             time_run = row[3]
             time_run_exit = row[4]
-            run_status = row[5]
-            task_times[(task, point, submit_num)] = (time_run, time_run_exit, run_status)
-        return task_times
+            platform_name = row[5]
+            job_id = row[6]
+            flow_nums = row[7]
+            run_status = row[8]
+            manual_sub = row[9]
+            
+            task_info[(name, point, submit_num)] = (
+                time_run,
+                job_id,
+                run_status,
+                time_run_exit,
+                platform_name,
+                manual_sub
+            )
+        
+        return task_info
 
     
     # provenance json creation (yProv4WFs)
     async def populate_prov_workflow(self, start: str, end: str ):
         try:
-            self.prov_workflow = Workflow(str(uuid4()), self.workflow_name)
+            # metti uuid dato da cylc per workflow
+            #self.prov_workflow = Workflow(str(uuid4()), self.workflow_name)
+            self.prov_workflow = Workflow(self.uuid_str, self.workflow_name)
             self.prov_workflow._start_time = start
             self.prov_workflow._engineWMS = 'Cylc'
             self.prov_workflow._level = '0'
             self.prov_workflow._resource_cwl_uri = workflow_files.get_flow_file(self.workflow)
+            self.prov_workflow._type = self.get_run_mode()
             data_in = Data(str(uuid4()), workflow_files.get_flow_file(self.workflow))
             self.prov_workflow.add_input(data_in)
             data_in.set_consumer(self.prov_workflow._id)
@@ -700,7 +715,7 @@ class Scheduler:
             }
             #print(execution_input)
         
-            task_times = await self.get_task_times(self.workflow)
+            task_infos = await self.get_task_infos(self.workflow)
             config = get_config(self.workflow, self.options, self.flow_file)
             stp = self.config.cfg['scheduling']['initial cycle point'] 
             #stp = self.config.start_point
@@ -714,7 +729,7 @@ class Scheduler:
                 tokens = Tokens(node, relative=True)
                 task_name = tokens['task']
                 point = tokens['cycle']
-
+                
                 task = Task(str(uuid4()), task_name)
                 task._level = '1'
 
@@ -722,23 +737,35 @@ class Scheduler:
                     if runtime['name'] == task_name and str(runtime['point']) == point:
                         submit_num = runtime['submit_num']
                         task_key = (task_name, point, submit_num)
-
-                        if task_key in task_times:
-                            st, et, s = task_times[task_key]
+                        
+                        if task_key in task_infos:
+                            task_info = task_infos[task_key]
+                            st = task_info[0]
+                            jid = task_info[1]
+                            s = task_info[2] 
+                            et = task_info[3] if len(task_info) > 3 else None
+                            pn = task_info[4] if len(task_info) > 4 else None
+                            ms = task_info[5] if len(task_info) > 5 else None
+                            task.set_id(jid)
                             task._start_time = st 
-                            task._end_time = et 
-                            task._status = self.get_task_status(s)
-
+                            task._end_time = et if et is not None else None
+                            if st is not None:
+                                task._status = s
+                            else:
+                                task._status = "killed"
+                            if ms == "1":
+                                task._manual_submit = "manually submitted" 
+                            task._run_platform = pn
                         # Add output data to the task
                         data_out = Data(str(uuid4()), get_task_job_job_log(self.workflow, runtime['point'], task_name, submit_num))
                         task.add_output(data_out)
                         data_out.set_producer(task._id)
                         
                         break
-
+                
                 # Add task to the workflow and task map
                 self.prov_workflow.add_task(task)
-                task_map[node] = task
+                task_map[node] = task                     
 
             # Establish dependencies between tasks based on edges
             for left, right in edges:
@@ -791,7 +818,6 @@ class Scheduler:
                     await commands.run_cmd(commands.poll_tasks, self, ['*/*'])
 
             self.run_event_handlers(self.EVENT_STARTUP, 'workflow starting')
-            
             await asyncio.gather(
                 *main_loop.get_runners(
                     self.main_loop_plugins,
@@ -807,8 +833,7 @@ class Scheduler:
             wf_start = datetime.now().isoformat()
             while True:  # MAIN LOOP
                 await self._main_loop()
-                
-                    
+
         except SchedulerStop as exc:
             # deliberate stop
             await self.shutdown(exc)
@@ -823,13 +848,25 @@ class Scheduler:
                         self
                     )
                 )
+                # creation of provenance json file (yProv4WFs)
+                wf_stop = datetime.now().isoformat()
+                work_dir = get_workflow_run_dir(self.workflow)
+                try:
+                    self.prov_workflow = await self.populate_prov_workflow(wf_start, wf_stop)
+                    self.prov_workflow.prov_to_json(work_dir)
+                    print("if manually stopped prov is saved")
+                    #TODO understand how to save this info
+                except Exception as e:
+                    print(f"Error in to_prov: {e}")
+                    traceback.print_exc()
+                    return None
             except Exception as exc:
                 # Need to log traceback manually because otherwise this
                 # exception gets swallowed
                 LOG.exception(exc)
                 raise
 
-        except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+        except asyncio.CancelledError as exc:
             await self.handle_exception(exc)
 
         except CylcError as exc:  # Includes SchedulerError
@@ -851,16 +888,15 @@ class Scheduler:
         else:
             # main loop ends (not used?)
             await self.shutdown(SchedulerStop(StopMode.AUTO.value))
-        
+
         finally:
-            
             # creation of provenance json file (yProv4WFs)
             wf_stop = datetime.now().isoformat()
             work_dir = get_workflow_run_dir(self.workflow)
             try:
                 self.prov_workflow = await self.populate_prov_workflow(wf_start, wf_stop)
-                json = self.prov_workflow.prov_to_json(work_dir)
-    
+                self.prov_workflow.prov_to_json(work_dir)
+                print("automatic shutdown, prov is saved")
             except Exception as e:
                 print(f"Error in to_prov: {e}")
                 traceback.print_exc()
@@ -918,13 +954,36 @@ class Scheduler:
         """Run the startup sequence and set the main loop running.
 
         Lightweight wrapper for testing convenience.
-
         """
+        # register signal handlers
+        for sig in (
+            # ctrl+c
+            signal.SIGINT,
+            # the "stop please" signal
+            signal.SIGTERM,
+            # the controlling process bailed
+            # (e.g. terminal quit in no detach mode)
+            signal.SIGHUP,
+        ):
+            signal.signal(sig, self._handle_signal)
+
         await self.start()
         # note run_scheduler handles its own shutdown logic
         await self.run_scheduler()
 
+    def _handle_signal(self, sig: int, frame) -> None:
+        """Handle a signal."""
+        LOG.critical(f'Signal {signal.Signals(sig).name} received')
+        if sig in {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}:
+            if self.stop_mode == StopMode.REQUEST_NOW:
+                # already shutting down NOW -> escalate to NOW_NOW
+                # (i.e. don't run/wait for event handlers)
+                stop_mode = StopMode.REQUEST_NOW_NOW
+            else:
+                # stop NOW (orphan running tasks)
+                stop_mode = StopMode.REQUEST_NOW
 
+            self._set_stop(stop_mode)
 
     def _load_pool_from_tasks(self):
         """Load task pool with specified tasks, for a new run."""
@@ -1090,7 +1149,7 @@ class Scheduler:
         # Remaining unprocessed messages have no corresponding task proxy.
         # For example, if I manually set a running task to succeeded, the
         # proxy can be removed, but the orphaned job still sends messages.
-        for _id, tms in messages.items():
+        for tms in messages.values():
             warn = "Undeliverable task messages received and ignored:"
             for _, msg in tms:
                 warn += f'\n  {msg.job_id}: {msg.severity} - "{msg.message}"'
@@ -1156,6 +1215,42 @@ class Scheduler:
         self.proc_pool.set_stopping()
         self.stop_mode = stop_mode
         self.update_data_store()
+
+    def kill_tasks(
+        self, itasks: 'Iterable[TaskProxy]', warn: bool = True
+    ) -> int:
+        """Kill tasks if they are in a killable state.
+
+        Args:
+            itasks: Tasks to kill.
+            warn: Whether to warn about tasks that are not in a killable state.
+
+        Returns number of tasks that could not be killed.
+        """
+        jobless = self.get_run_mode() == RunMode.SIMULATION
+        to_kill: List[TaskProxy] = []
+        unkillable: List[TaskProxy] = []
+        for itask in itasks:
+            if itask.state(*TASK_STATUSES_ACTIVE):
+                itask.state_reset(
+                    # directly reset to failed in sim mode, else let
+                    # task_job_mgr handle it
+                    status=(TASK_STATUS_FAILED if jobless else None),
+                    is_held=True,
+                )
+                self.data_store_mgr.delta_task_state(itask)
+                to_kill.append(itask)
+            else:
+                unkillable.append(itask)
+        if warn and unkillable:
+            LOG.warning(
+                "Tasks not killable: "
+                f"{', '.join(sorted(t.identity for t in unkillable))}"
+            )
+        if not jobless:
+            self.task_job_mgr.kill_task_jobs(self.workflow, to_kill)
+
+        return len(unkillable)
 
     def get_restart_num(self) -> int:
         """Return the number of the restart, else 0 if not a restart.
@@ -1648,7 +1743,7 @@ class Scheduler:
     async def _main_loop(self) -> None:
         """A single iteration of the main loop."""
         tinit = time()
-        
+
         # Useful for debugging core scheduler issues:
         # import logging
         # self.pool.log_task_pool(logging.CRITICAL)
@@ -1683,7 +1778,7 @@ class Scheduler:
 
             if all(itask.is_ready_to_run()):
                 self.pool.queue_task(itask)
-     
+
         if self.xtrigger_mgr.sequential_spawn_next:
             self.pool.spawn_parentless_sequential_xtriggers()
 
@@ -1691,10 +1786,8 @@ class Scheduler:
             self.xtrigger_mgr.housekeep(self.pool.get_tasks())
 
         self.pool.clock_expire_tasks()
-    
         self.release_queued_tasks()
-        
-        # save information in runtime_data dictionary for provenance tracking (yProv4WFs)
+
         for itask in self.pool.get_tasks():
             name = itask.identity
             if name not in self.runtime_data:
@@ -1705,7 +1798,7 @@ class Scheduler:
             self.runtime_data[name]['point'] = itask.point
             self.runtime_data[name]['submit_num'] = itask.submit_num
             self.runtime_data[name]['start'] = datetime.now().isoformat()
-            
+
         if (
             self.get_run_mode() == RunMode.SIMULATION
             and sim_time_check(
@@ -1723,7 +1816,7 @@ class Scheduler:
         self.process_queued_task_messages()
         await self.process_command_queue()
         self.task_events_mgr.process_events(self)
-       
+
         # Update state summary, database, and uifeed
         self.workflow_db_mgr.put_task_event_timers(self.task_events_mgr)
 
@@ -1763,9 +1856,10 @@ class Scheduler:
         # If public database is stuck, blast it away by copying the content
         # of the private database into it.
         self.database_health_check()
+
         # Shutdown workflow if timeouts have occurred
         self.timeout_check()
-       
+
         # Does the workflow need to shutdown on task failure?
         await self.workflow_shutdown()
 
@@ -1784,7 +1878,7 @@ class Scheduler:
         if not has_updated and not self.stop_mode:
             # Has the workflow stalled?
             self.check_workflow_stalled()
-        
+
         # Sleep a bit for things to catch up.
         # Quick sleep if there are items pending in process pool.
         # (Should probably use quick sleep logic for other queues?)
@@ -1800,11 +1894,9 @@ class Scheduler:
         else:
             duration = self.INTERVAL_MAIN_LOOP - elapsed
         await asyncio.sleep(duration)
-        
         # Record latest main loop interval
         self.main_loop_intervals.append(time() - tinit)
-
-        
+        # END MAIN LOOP
 
     def _update_workflow_state(self):
         """Update workflow state in the data store and push out any deltas.
@@ -1875,9 +1967,21 @@ class Scheduler:
         # At the moment this method must be called from the main_loop.
         # In the future it should shutdown the main_loop itself but
         # we're not quite there yet.
+
+        # cancel signal handlers
+        def _handle_signal(sig, frame):
+            LOG.warning(
+                f'Signal {signal.Signals(sig).name} received,'
+                ' already shutting down'
+            )
+
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, _handle_signal)
+
         try:
+            # action shutdown
             await self._shutdown(reason)
-        except (KeyboardInterrupt, asyncio.CancelledError, Exception) as exc:
+        except (asyncio.CancelledError, Exception) as exc:
             # In case of exception in the shutdown method itself.
             LOG.error("Error during shutdown")
             # Suppress the reason for shutdown, which is logged separately
@@ -1899,7 +2003,6 @@ class Scheduler:
             try:
                 self.proc_pool.close()
                 if self.proc_pool.is_not_done():
-                    # e.g. KeyboardInterrupt
                     self.proc_pool.terminate()
                 self.proc_pool.process()
             except Exception as exc:
@@ -2187,7 +2290,7 @@ class Scheduler:
 
         Call this method whenever the Scheduler's state has changed in a way
         that requires a data store update.
-        See cylc.flow.workflow_status.get_workflow_status() for a
+        See cylc.flow.workflow_status.get_workflow_status_msg() for a
         (non-exhaustive?) list of properties that if changed will require
         this update.
 

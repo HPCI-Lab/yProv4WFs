@@ -91,6 +91,11 @@ class Workflow(Node):
             }
             if self._resource_cwl_uri is not None:
                 doc['activity'][self._id]['yprov4wfs:resource_uri'] = self._resource_cwl_uri
+            if self._type is not None:
+                doc['activity'][self._id]['yprov4wfs:type'] = self._type
+            if self._description is not None:
+                doc['activity'][self._id]['yprov4wfs:description'] = self._description
+
 
             for input in self._inputs:
                 if input is not None:
@@ -118,6 +123,14 @@ class Workflow(Node):
                         'yprov4wfs:status': task._status,
                         'yprov4wfs:level': task._level
                     }
+                    if task._manual_submit is not None:
+                        doc['activity'][task._id]['yprov4wfs:manual_submit'] = task._manual_submit
+                    if task._run_platform is not None:
+                        doc['activity'][task._id]['yprov4wfs:run_platform'] = task._run_platform
+                    if task._delay is not None:
+                        doc['activity'][task._id]['yprov4wfs:delay'] = task._delay
+                    if task._timeout is not None:
+                        doc['activity'][task._id]['yprov4wfs:timeout'] = task._timeout
 
                     if task._agent is not None:
                         doc['agent'][task._agent._id] = {
@@ -161,16 +174,34 @@ class Workflow(Node):
                             doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': prev_task._id}
                             
             # Helper function to remove empty lists from the dictionary
-            def remove_empty_lists(d):
-                if isinstance(d, dict):
-                    return {k: remove_empty_lists(v) for k, v in d.items() if v != []}
-                elif isinstance(d, list):
-                    return [remove_empty_lists(i) for i in d if i != []]
+            def preprocess(obj):
+                """
+                Recursively preprocess a dictionary or list to:
+                1. Remove empty lists from dictionaries or lists.
+                2. Replace None/null values with the string "None".
+                3. Clean extraneous spaces in strings (but keep empty strings as is).
+                """
+                if isinstance(obj, dict):
+                    return {
+                        k.strip(): preprocess(v) 
+                        for k, v in obj.items() 
+                        if v != []  # Remove keys with empty list values
+                    }
+                elif isinstance(obj, list):
+                    return [
+                        preprocess(i) 
+                        for i in obj 
+                        if i != []  # Remove empty lists from the list
+                    ]
+                elif obj is None:
+                    return "None"
+                elif isinstance(obj, str):
+                    cleaned = obj.strip()  # Clean spaces from strings
+                    return cleaned
                 else:
-                    return d
+                    return obj
 
-            # Remove empty lists from the document
-            doc = remove_empty_lists(doc)
+            doc = preprocess(doc)
             
             def convert(obj):
                 if isinstance(obj, Path):

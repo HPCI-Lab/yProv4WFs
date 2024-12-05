@@ -27,6 +27,10 @@ class Task(Node):
         self._outputs = []
         self._prev = []
         self._next = []
+        self._manual_submit = None
+        self._run_platform = None
+        self._delay = None
+        self._timeout = None
 
     def add_input(self, data: Data):
         data.set_consumer(self._name)
