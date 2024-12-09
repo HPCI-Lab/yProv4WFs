@@ -12,6 +12,7 @@ Necessary steps to work with yProv4WFs in Cylc:
     2. create a conda environment and install pip
       * ```bash
         conda create -n cylc
+        conda activate cylc
         conda install pip
         ```
     3. clone cylc-flow repository
