@@ -6,7 +6,7 @@ Necessary steps to work with yProv4WFs in Cylc:
 -->
 - Install Cylc (inside conda environment preferably):
   - using conda:
-    1. create a directoty and access it
+    1. create a directory and access it
       * ```bash
         mkdir <dir_name>
         cd <dir_name>
@@ -26,31 +26,31 @@ Necessary steps to work with yProv4WFs in Cylc:
         pip install cylc-flow
         ```
     4. go to the location of python module
-      * verify installation: 
-       ```bash
-       pip show cylc-flow
-       ```
-       The result should be similiar to this:
-       ```bash
-       Name: cylc-flow
-       Version: 8.4.0
-       Summary: A workflow engine
-       for cycling systems
-       Home-page: https://cylc.org/
-       Author: Hilary Oliver Author-email:
-       License: GPL
-       Location: /<dir_path>/conda/envs/cylc/lib/python3.11/site-packages
-       Requires: ansimarkup, async-timeout, colorama, graphene, importlib_metadata, jinja2, metomi-isodatetim e, packaging, promise, protobuf, psutil, pyzma, rx, urwid Required-by: cylc-rose
-       ```
-      * go to Location and find cylc directory:
-       ```bash
-       cd /<dir_path>/conda/envs/cylc/lib/python3.11/site-packages
-       ls
-       ```
-      * enter cylc directory and continue by entering flow directory too:
-        ```bash
-        cd cylc/flow
-        ```
+        * verify installation: 
+         ```bash
+         pip show cylc-flow
+         ```
+        The result should be similiar to this:
+         ```bash
+         Name: cylc-flow
+         Version: 8.4.0
+         Summary: A workflow engine
+         for cycling systems
+         Home-page: https://cylc.org/
+         Author: Hilary Oliver Author-email:
+         License: GPL
+         Location: /<dir_path>/conda/envs/cylc/lib/python3.11/site-packages
+         Requires: ansimarkup, async-timeout, colorama, graphene, importlib_metadata, jinja2, metomi-isodatetim e, packaging, promise, protobuf, psutil, pyzma, rx, urwid Required-by: cylc-rose
+         ```
+        * go to Location and find cylc directory:
+         ```bash
+         cd /<dir_path>/conda/envs/cylc/lib/python3.11/site-packages
+         ls
+         ```
+        * enter cylc directory and continue by entering flow directory too:
+          ```bash
+          cd cylc/flow
+          ```
     5. modify file scheduler_cli.py via text editor (es. nano, vim):
         ```bash
         nano scheduler_cli.py
