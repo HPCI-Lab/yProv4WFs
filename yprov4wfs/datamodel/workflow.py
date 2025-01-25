@@ -183,7 +183,7 @@ class Workflow(Node):
                 """
                 if isinstance(obj, dict):
                     return {
-                        k.strip(): preprocess(v) 
+                        k.strip() if k is not None else k: preprocess(v) 
                         for k, v in obj.items() 
                         if v != []  # Remove keys with empty list values
                     }

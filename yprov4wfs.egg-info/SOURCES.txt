@@ -1,6 +1,7 @@
 LICENSE
 README.md
 pyproject.toml
+setup.py
 yProv4WFs.egg-info/PKG-INFO
 yProv4WFs.egg-info/SOURCES.txt
 yProv4WFs.egg-info/dependency_links.txt
