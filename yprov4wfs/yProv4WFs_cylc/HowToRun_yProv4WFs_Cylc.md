@@ -21,11 +21,12 @@ Necessary steps to work with yProv4WFs in Cylc:
         conda activate cylc
         conda install pip
         ```
-    3. install cylc-flow via pip
+  - valid both inside conda or outside:
+    1. install cylc-flow via pip
       * ```bash
         pip install cylc-flow
         ```
-    4. go to the location of python module
+    2. go to the location of python module
         * verify installation: 
          ```bash
          pip show cylc-flow
@@ -48,10 +49,10 @@ Necessary steps to work with yProv4WFs in Cylc:
          ls
          ```
         * enter cylc directory and continue by entering flow directory too:
-          ```bash
-          cd cylc/flow
-          ```
-    5. modify file scheduler_cli.py via text editor (es. nano, vim):
+         ```bash
+         cd cylc/flow
+         ```
+    3. modify file scheduler_cli.py via text editor (es. nano, vim):
         ```bash
         nano scheduler_cli.py
         ```
@@ -99,7 +100,8 @@ Necessary steps to work with yProv4WFs in Cylc:
         ```bash
         from yprov4wfs.yProv4WFs_cylc.yprov4wfs_Cylc import Scheduler, SchedulerError
         ```
-      -->
+    -->
+
 - Using yProv4WFs library (inside conda environment preferably):
   1. Installing using pip:
     * ```bash
