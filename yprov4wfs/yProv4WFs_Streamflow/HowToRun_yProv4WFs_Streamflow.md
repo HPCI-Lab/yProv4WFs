@@ -15,16 +15,13 @@ git clone https://github.com/alpha-unito/streamflow.git
   * ```bash
      nano streamflow/provenance/__init__.py
    ```
-  - Replace the code inside the file with the following one:
+3. Replace the code inside the file with the following one:
    * ```bash
      from yprov4wfs.yProv4WFs_Streamflow.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
-
+   
      prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
      ```
 
-  <!--
-    from yProv4wfs.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
-  -->
     
   
 - Using yProv4WFs library:
