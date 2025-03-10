@@ -1,8 +1,7 @@
 ## yProv4WFs - StreamFlow
-The yProv4WFs was developed for StreamFlow version 0.2.0.dev11
+**yProv4WFs** was developed for **StreamFlow** version `0.2.0.dev11`.
 
-Necessary steps to work with yProv4WFs in StreamFlow:
-
+### Setup Instructions
 - Clone StreamFlow repository
    ```bash
    git clone https://github.com/alpha-unito/streamflow.git
