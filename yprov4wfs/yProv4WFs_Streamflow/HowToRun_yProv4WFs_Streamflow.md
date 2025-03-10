@@ -20,7 +20,7 @@ git clone https://github.com/alpha-unito/streamflow.git
      from yprov4wfs.yProv4WFs_Streamflow.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
    
      prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
-     ```
+   ```
 
     
   
