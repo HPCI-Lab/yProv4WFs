@@ -1,4 +1,5 @@
 ## yProv4WFs - StreamFlow
+The yProv4WFs was developed for StreamFlow version 0.2.0.dev11
 
 Necessary steps to work with yProv4WFs in StreamFlow:
 
@@ -6,7 +7,26 @@ Necessary steps to work with yProv4WFs in StreamFlow:
 ```bash
 git clone https://github.com/alpha-unito/streamflow.git
 ```
- 
+  1. Go into your StreamFlow folder locally 
+    * ```bash
+        cd /<dir_path>/
+      ```
+  2. Modify file /streamflow/provenance/__init__.py via text editor (es. nano, vim):
+    * ```bash
+      nano streamflow/provenance/__init__.py
+      ```
+    Replace the code inside the file with the follwing one:
+    * ```bash
+      from yprov4wfs.yProv4WFs_Streamflow.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
+
+      prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
+      ```
+
+  <!--
+    from yProv4wfs.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
+  -->
+    
+  
 - Using yProv4WFs library:
   1. Installing using pip:
     * ```bash
@@ -16,8 +36,9 @@ git clone https://github.com/alpha-unito/streamflow.git
       ```bash
       pip show yprov4wfs
       ```
-  2. Installing by downloading the repository:
+  2. Installing by cloning the repository:
     * ```bash
+      git clone https://github.com/HPCI-Lab/yProv4WFs.git
       cd /path/to/your/project
       ```
     * ```bash
@@ -31,22 +52,17 @@ git clone https://github.com/alpha-unito/streamflow.git
       ```bash
       pip show yprov4wfs
       ```
+  
+  N.B : If you are working inside a Docker environment be sure to install yProv4WFs library via:
+    * ```bash
+      pip install yprov4wfs
+      ```
+    * or defining the installation in the DockerFile
 <!--
 - Add StreamFlow folder into your own project
 -->
 
 - Follow [StreamFlow documentation](https://github.com/alpha-unito/streamflow/blob/master/README.md) for running your project using Docker or Kubernetes 
-
-- Go into StreamFlow folder locally and modify file /streamflow/provenance/__init__.py
-  Completely delete the content and replace with the following code:
-<!--
-  from yProv4wfs.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
--->
-  ```bash
-  from yprov4wfs.yProv4WFs_Streamflow.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
-
-  prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
-  ```
 
 - Create your workflow following StreamFlow instructions
   (Example: https://github.com/alpha-unito/streamflow/tree/master/examples/flux)

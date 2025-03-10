@@ -11,6 +11,8 @@ from streamflow.core.context import StreamFlowContext
 from streamflow.core.exception import WorkflowProvenanceException
 from streamflow.core.persistence import DatabaseLoadingContext, StreamFlowContext, DatabaseLoadingContext
 from streamflow.log_handler import logger
+
+#yprov4wfs imports
 from yprov4wfs.datamodel.workflow import Workflow
 from yprov4wfs.datamodel.task import Task
 from yprov4wfs.datamodel.data import Data, FileType
@@ -76,7 +78,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                     "name": data_out._name,
                     "producer": data_out._producer
                 }
-                print(execution_output)
+                #print(execution_output)
             
             execution_wf = {
                 "id": self.prov_workflow._id,
@@ -90,7 +92,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                 "output": {o: o for o in self.prov_workflow._outputs},
                 "level": self.prov_workflow._level,
             }
-            print(execution_wf)
+            #print(execution_wf)
             
             for task in wf.steps:
                 if s := wf.steps.get(task):
@@ -110,7 +112,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                             "startTime": task._start_time,
                             "level": task._level
                         }
-                        print(execution_task)
+                        #print(execution_task)
                    
                         for input in await self.context.database.get_input_ports(s.persistent_id):
                             data_in = Data(str(uuid.uuid4()), input["name"])

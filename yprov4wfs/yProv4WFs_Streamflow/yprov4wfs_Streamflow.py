@@ -13,6 +13,7 @@ from streamflow.core.exception import WorkflowExecutionException
 from streamflow.workflow.executor import StreamFlowExecutor
 from streamflow.workflow.step import ExecuteStep
 
+#yprov4wfs imports
 from yprov4wfs.datamodel.workflow import Workflow
 from yprov4wfs.datamodel.task import Task
 from yprov4wfs.datamodel.data import Data, FileType
@@ -60,7 +61,7 @@ class yProv4WfsExecutor(StreamFlowExecutor):
                             "name": prov_input._name,
                             "consumer": prov_input._consumer
                         }
-                        print(ex_d_in)
+                        #print(ex_d_in)
                 for out_key, out_value in t.output_ports.items():
                     if o := t.get_output_port(out_key):
                         prov_output = Data(o.name,o.name)
@@ -71,7 +72,7 @@ class yProv4WfsExecutor(StreamFlowExecutor):
                             "name": prov_output._name,
                             "producer": prov_output._producer
                         }
-                        print(ex_d_out)
+                        #print(ex_d_out)
        
             self.prov_workflow.add_task(prov_task)
             
@@ -85,7 +86,7 @@ class yProv4WfsExecutor(StreamFlowExecutor):
                 "inputs": [input for input in prov_task._inputs],
                 "outputs": [output for output in prov_task._outputs]
             }
-            print(execution_task)
+            #print(execution_task)
         
         self.prov_workflow._end_time = streamflow.core.utils.get_date_from_ns(self.runtime_data['end_time'])
         self.prov_workflow._status = self.get_status(self.runtime_data['status']) 
@@ -97,7 +98,7 @@ class yProv4WfsExecutor(StreamFlowExecutor):
                 "name": self.prov_workflow._name,
                 "startTime": self.prov_workflow._start_time,
             }
-        print(execution_wf)
+        #print(execution_wf)
             
             
         return self.prov_workflow

@@ -730,9 +730,8 @@ class Scheduler:
     # provenance json creation (yProv4WFs)
     async def populate_prov_workflow(self, start: str, end: str ):
         try:
-            # metti uuid dato da cylc per workflow
-            #self.prov_workflow = Workflow(str(uuid4()), self.workflow_name)
-            self.prov_workflow = Workflow(self.uuid_str, self.workflow_name)
+            #self.prov_workflow = Workflow(self.uuid_str, self.workflow_name)
+            self.prov_workflow = Workflow(self.uuid_str, self.workflow)
             self.prov_workflow._start_time = start
             self.prov_workflow._engineWMS = 'Cylc'
             self.prov_workflow._level = '0'
