@@ -8,19 +8,19 @@ Necessary steps to work with yProv4WFs in StreamFlow:
 git clone https://github.com/alpha-unito/streamflow.git
 ```
   1. Go into your StreamFlow folder locally:
-    ```bash
-     cd /<dir_path>/
-    ```
+    * ```bash
+      cd /<dir_path>/
+      ```
   3. Modify file /streamflow/provenance/__init__.py via text editor (es. nano, vim):
-     ```bash
-      nano streamflow/provenance/__init__.py
-     ```
-    * Replace the code inside the file with the follwing one:
-     ```bash
-      from yprov4wfs.yProv4WFs_Streamflow.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
-
-      prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
-     ```
+     * ```bash
+       nano streamflow/provenance/__init__.py
+       ```
+    - Replace the code inside the file with the follwing one:
+     * ```bash
+       from yprov4wfs.yProv4WFs_Streamflow.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
+  
+       prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
+       ```
 
   <!--
     from yProv4wfs.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
