@@ -4,26 +4,24 @@ The yProv4WFs was developed for StreamFlow version 0.2.0.dev11
 Necessary steps to work with yProv4WFs in StreamFlow:
 
 - Clone StreamFlow repository
-```bash
-git clone https://github.com/alpha-unito/streamflow.git
-```
-1. Go into your StreamFlow folder locally:
-* ```bash
-   cd /<dir_path>/
-  ```
-2. Modify file /streamflow/provenance/__init__.py via text editor (es. nano, vim): 
-* ```bash
-  nano streamflow/provenance/__init__.py
- ```
-3. Replace the code inside the file with the following one:
-* ```bash
-  from yprov4wfs.yProv4WFs_Streamflow.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
+   ```bash
+   git clone https://github.com/alpha-unito/streamflow.git
+   ```
+   1. Go into your StreamFlow folder locally:
+   * ```bash
+      cd /<dir_path>/
+     ```
+   2. Modify file /streamflow/provenance/__init__.py via text editor (es. nano, vim):
+   * ```bash
+     nano streamflow/provenance/__init__.py
+     ```
+   3. Replace the code inside the file with the following one:
+   * ```bash
+     from yprov4wfs.yProv4WFs_Streamflow.yprov4wfs_Streamflow_fromdb import yProv4WFsProvenanceManager
+     
+     prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
+     ```
 
-  prov_classes = {"run_crate": {"cwl": yProv4WFsProvenanceManager}}
- ```
-
-    
-  
 - Using yProv4WFs library:
   1. Installing using pip:
     * ```bash
@@ -42,6 +40,7 @@ git clone https://github.com/alpha-unito/streamflow.git
       pip install .
       ```
   3. Installing from a GitHub Repository:
+     
     * ```bash
       pip install git+https://github.com/HPCI-Lab/yProv4WFs.git
       ```
