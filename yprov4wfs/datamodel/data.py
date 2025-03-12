@@ -35,6 +35,7 @@ class Data:
         self._producer = None
         self._consumer = None
         self._agent = None
+        self._info = None
         self.is_input = False
         self.is_output = False
         

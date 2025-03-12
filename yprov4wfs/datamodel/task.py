@@ -31,6 +31,7 @@ class Task(Node):
         self._run_platform = None
         self._delay = None
         self._timeout = None
+        self._info = None
 
     def add_input(self, data: Data):
         data.set_consumer(self._name)

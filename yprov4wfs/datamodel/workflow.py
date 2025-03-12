@@ -7,6 +7,8 @@ from uuid import uuid4
 import traceback
 import json
 import os
+import numpy as np
+import pandas as pd
 
 #------------------WORKFLOW------------------–# 
 """
@@ -41,6 +43,8 @@ class Workflow(Node):
         self._type = None
         self._engineWMS = None
         self._resource_cwl_uri = None
+############# for tracking the data ###########
+        self._data = []
         
     def add_input(self, data: Data):
         data.set_consumer(self)
@@ -57,9 +61,19 @@ class Workflow(Node):
         
     def get_task_by_id(self, id):
         for task in self._tasks:
-            if task.id == id:
+            if task._id == id:
                 return task
         return None
+################### adding and retriving data from workflow ###########
+    def add_data(self, item):
+        if not isinstance(item, Data):
+            raise TypeError(f"Expected an instance of [yprov4wfs.datamodel.data] Data, got {type(item).__name__}")
+        self._data.append(item)
+
+    def get_data_by_id(self, id):
+        for data in self._data:
+            if data._id == id:
+                return data
 
     # to_prov function without dependences to prov.model library
     def to_prov(self):
@@ -115,7 +129,7 @@ class Workflow(Node):
             
             for task in self._tasks:
                 if task is not None:
-                    doc['activity'][task._id] = {
+                    task_items = {
                         'prov:startTime': task._start_time,
                         'prov:endTime': task._end_time,
                         'prov:label': task._name,
@@ -123,6 +137,12 @@ class Workflow(Node):
                         'yprov4wfs:status': task._status,
                         'yprov4wfs:level': task._level
                     }
+                    ### parse the _info dict to auto extract the metrics
+                    if isinstance(task._info, dict):
+                        for key, value in task._info.items():
+                            task_items[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
+                    doc['activity'][task._id] = task_items
+
                     if task._manual_submit is not None:
                         doc['activity'][task._id]['yprov4wfs:manual_submit'] = task._manual_submit
                     if task._run_platform is not None:
@@ -156,22 +176,39 @@ class Workflow(Node):
 
                     for data_item in task._inputs:
                         if data_item is not None:
-                            doc['entity'][data_item._id] = {
+                            entity_entry = {
                                 'prov:label': data_item._name,
-                                'prov:type': 'prov:Entity'
+                                'prov:type': 'prov:Entity',
                             }
+                            # parse the _info dict to auto extract the metrics for a data item (inputs)
+                            if isinstance(data_item._info, dict):
+                                for key, value in data_item._info.items():
+                                    entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
+                                
+                            doc['entity'][data_item._id] = entity_entry
                             doc['used'][f'{str(uuid4())}'] = {'prov:activity': task._id, 'prov:entity': data_item._id}
                     for data_item in task._outputs:
                         if data_item is not None:
-                            doc['entity'][data_item._id] = {
+                            entity_entry = {
                                 'prov:label': data_item._name,
-                                'prov:type': 'prov:Entity'
+                                'prov:type': 'prov:Entity',
                             }
+                            # parse the _info dict to auto extract the metrics for a data item (outputs)
+                            if isinstance(data_item._info, dict):
+                                for key, value in data_item._info.items():
+                                    entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
+                            
+                        # print(entity_entry)
+                        doc['entity'][data_item._id] = entity_entry
                         doc['wasGeneratedBy'][f'{str(uuid4())}'] = {'prov:entity': data_item._id, 'prov:activity': task._id}
 
                     if task._prev is not None:
                         for prev_task in task._prev:
                             doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': prev_task._id}
+                    # Connection between a task and the next task
+                    if task._next is not None:
+                        for next_task in task._next:
+                            doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': next_task._id}
                             
             # Helper function to remove empty lists from the dictionary
             def preprocess(obj):
@@ -237,4 +274,15 @@ class Workflow(Node):
             print(f"Error: {e} ")
             traceback.print_exc()
             return None
-        
+    # To converst the values
+    @staticmethod
+    def convert_value(value):
+        if isinstance(value, (np.float64, pd.Float64Dtype, np.int64, pd.Int64Dtype)):
+            return str(value.tolist())
+        elif isinstance(value, np.ndarray):
+            return value.tolist()  
+        elif isinstance(value, dict):
+            return {k: Workflow.convert_value(v) for k, v in value.items()}  
+        elif isinstance(value, list):
+            return [Workflow.convert_value(v) for v in value]  
+        return value  # Return as is if it's already serializable
