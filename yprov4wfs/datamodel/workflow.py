@@ -206,9 +206,14 @@ class Workflow(Node):
                         for prev_task in task._prev:
                             doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': prev_task._id}
                     # Connection between a task and the next task
+                    # if task._next is not None:
+                    #     for next_task in task._next:
+                    #         doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': next_task._id}
                     if task._next is not None:
-                        for next_task in task._next:
+                        valid_next_tasks = [t for t in task._next if t is not None]
+                        for next_task in valid_next_tasks:
                             doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': next_task._id}
+
                             
             # Helper function to remove empty lists from the dictionary
             def preprocess(obj):
