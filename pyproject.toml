@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yprov4wfs"
+version = "0.0.6"
+authors = [
+  { name="Carolina Sopranzetti"},
+]
+description = "A module for tracking the provenance of a workflow using a Workflow Management System."
+readme = "README.md"
+license = { text = "GNU General Public License v3 (GPLv3)" }
+requires-python = ">=3.8"
+classifiers = [
+    'Programming Language :: Python :: 3',
+    'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',  
+    'Operating System :: OS Independent',
+]
+maintainers = [
+  { name = "HPCI Lab - University of Trento" }
+]
+
+[project.urls]
+Homepage = "https://github.com/HPCI-Lab/yProv4WFs"
+Repository = "https://github.com/HPCI-Lab/yProv4WFs.git"
+
