@@ -203,7 +203,8 @@ class Workflow(Node):
                         doc['wasGeneratedBy'][f'{str(uuid4())}'] = {'prov:entity': data_item._id, 'prov:activity': task._id}
 
                     if task._prev is not None:
-                        for prev_task in task._prev:
+                        valid_prev_tasks = [t for t in task._next if t is not None]
+                        for prev_task in valid_prev_tasks:
                             doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': prev_task._id}
                     # Connection between a task and the next task
                     # if task._next is not None:
