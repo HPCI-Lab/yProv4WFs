@@ -57,7 +57,7 @@ class Workflow(Node):
         
     def get_task_by_id(self, id):
         for task in self._tasks:
-            if task.id == id:
+            if task._id == id:
                 return task
         return None
 

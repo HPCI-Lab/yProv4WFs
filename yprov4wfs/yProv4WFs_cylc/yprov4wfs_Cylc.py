@@ -695,64 +695,47 @@ class Scheduler:
             ON 
                 task_jobs.name = task_states.name
                 AND task_jobs.cycle = task_states.cycle
-                AND task_jobs.submit_num = task_states.submit_num
                 AND task_jobs.flow_nums = task_states.flow_nums
         """
+        #         AND task_jobs.submit_num = task_states.submit_num
+        # """
         
         with CylcWorkflowDAO(get_workflow_run_pub_db_path(workflow_id), is_public=True) as dao:
             results = list(dao.connect().execute(query))
-        
-        task_info = {}
-        for row in results:
-            name = row[0]
-            point = row[1]
-            submit_num = row[2]
-            time_run = row[3]
-            time_run_exit = row[4]
-            platform_name = row[5]
-            job_id = row[6]
-            flow_nums = row[7]
-            run_status = row[8]
-            manual_sub = row[9]
-            
-            task_info[(name, point, submit_num)] = (
-                time_run,
-                job_id,
-                run_status,
-                time_run_exit,
-                platform_name,
-                manual_sub
+    
+        task_info = {
+            (row[0], row[1], row[2]): (
+                row[3],  # time_run
+                row[6],  # job_id
+                row[8],  # run_status
+                row[4],  # time_run_exit
+                row[5],  # platform_name
+                row[9]   # is_manual_submit
             )
+            for row in results
+        }
         
         return task_info
 
     
     # provenance json creation (yProv4WFs)
-    async def populate_prov_workflow(self, start: str, end: str ):
+    async def populate_prov_workflow(self, start: str, end: str):
         try:
-            #self.prov_workflow = Workflow(self.uuid_str, self.workflow_name)
             self.prov_workflow = Workflow(self.uuid_str, self.workflow)
             self.prov_workflow._start_time = start
             self.prov_workflow._engineWMS = 'Cylc'
             self.prov_workflow._level = '0'
             self.prov_workflow._resource_cwl_uri = workflow_files.get_flow_file(self.workflow)
             self.prov_workflow._type = str(self.get_run_mode())
+            
             data_in = Data(str(uuid4()), workflow_files.get_flow_file(self.workflow))
             self.prov_workflow.add_input(data_in)
             data_in.set_consumer(self.prov_workflow._id)
-            execution_input = {
-                "id": data_in._id,
-                "name": data_in._name,
-                "consumer": data_in._consumer
-            }
-            #print(execution_input)
-        
+            
             task_infos = await self.get_task_infos(self.workflow)
             config = get_config(self.workflow, self.options, self.flow_file)
-            stp = self.config.cfg['scheduling']['initial cycle point'] 
-            #stp = self.config.start_point
+            stp = self.config.cfg['scheduling']['initial cycle point']
             ftp = self.config.cfg['scheduling']['final cycle point']
-            #ftp = self.config.stop_point
             nodes, edges = _get_graph_nodes_edges(config, stp, ftp)
 
             task_map: Dict[str, Task] = {}
@@ -761,44 +744,34 @@ class Scheduler:
                 tokens = Tokens(node, relative=True)
                 task_name = tokens['task']
                 point = tokens['cycle']
-                
-                task = Task(str(uuid4()), task_name)
-                task._level = '1'
 
                 for key, runtime in self.runtime_data.items():
                     if runtime['name'] == task_name and str(runtime['point']) == point:
+                        task = Task(runtime['identity'], task_name)
+                        task._level = '1'
+                        #task.set_id(runtime['identity'])
                         submit_num = runtime['submit_num']
                         task_key = (task_name, point, submit_num)
                         
                         if task_key in task_infos:
                             task_info = task_infos[task_key]
-                            st = task_info[0]
-                            jid = task_info[1]
-                            s = task_info[2] 
-                            et = task_info[3] if len(task_info) > 3 else None
-                            pn = task_info[4] if len(task_info) > 4 else None
-                            ms = task_info[5] if len(task_info) > 5 else None
-                            task.set_id(jid)
-                            task._start_time = st 
-                            task._end_time = et if et is not None else None
-                            task._status = s
-                            if ms == "1":
-                                task._manual_submit = "manually submitted" 
-                            task._run_platform = pn
-                        # else:
-                        #     task._status = "scheduled but not executed"
-                        # Add output data to the task
+                            #task.set_id(task_info[1])
+                            task._start_time = task_info[0]
+                            task._end_time = task_info[3] if task_info[3] is not None else None
+                            task._status = task_info[2]
+                            if task_info[5] == "1":
+                                task._manual_submit = "manually submitted"
+                            task._run_platform = task_info[4]
+                        
                         data_out = Data(str(uuid4()), get_task_job_job_log(self.workflow, runtime['point'], task_name, submit_num))
                         task.add_output(data_out)
                         data_out.set_producer(task._id)
                         
                         break
                 
-                # Add task to the workflow and task map
                 self.prov_workflow.add_task(task)
                 task_map[node] = task                     
 
-            # Establish dependencies between tasks based on edges
             for left, right in edges:
                 left_task = task_map.get(left)
                 right_task = task_map.get(right)
@@ -806,12 +779,7 @@ class Scheduler:
                 if right and left:
                     left_task.set_prev(right_task)
                     right_task.set_next(left_task)
-                # elif right and not left:
-                #    right_task.set_next(None)
-                # elif left and not right:
-                #    left_task.set_prev(None)    
-               
-          
+            
             self.prov_workflow._end_time = end
             self.prov_workflow._status = str(get_workflow_status(self))
             
@@ -827,11 +795,10 @@ class Scheduler:
                 "output": {o: o for o in self.prov_workflow._outputs},
                 "level": self.prov_workflow._level,
             }
-            #print(execution_wf)
             
             return self.prov_workflow
         except Exception as e:
-            print(f"Error in to_prov: {e}")
+            print(f"Error in populate_prov_workflow: {e}")
             traceback.print_exc()
             return None
     
