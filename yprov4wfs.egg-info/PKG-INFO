@@ -1,4 +1,4 @@
-Metadata-Version: 2.4
+Metadata-Version: 2.1
 Name: yprov4wfs
 Version: 0.0.7
 Summary: A module for tracking the provenance of a workflow using a Workflow Management System.
@@ -14,9 +14,6 @@ Classifier: Operating System :: OS Independent
 Requires-Python: >=3.6
 Description-Content-Type: text/markdown
 License-File: LICENSE
-Dynamic: home-page
-Dynamic: license-file
-Dynamic: requires-python
 
 ## yProv4WFs
 yProv4WFs is a service to track the provenance of a workflow run via a Workflow Management System (WMS) at run time. It is compliant with the W3C PROV standard.
