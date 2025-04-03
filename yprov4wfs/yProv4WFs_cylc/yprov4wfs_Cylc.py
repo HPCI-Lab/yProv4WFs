@@ -744,24 +744,26 @@ class Scheduler:
                 tokens = Tokens(node, relative=True)
                 task_name = tokens['task']
                 point = tokens['cycle']
-
+                task = Task(str(uuid4()), task_name)
+                task._level = '1'
                 for key, runtime in self.runtime_data.items():
                     if runtime['name'] == task_name and str(runtime['point']) == point:
-                        task = Task(runtime['identity'], task_name)
-                        task._level = '1'
-                        #task.set_id(runtime['identity'])
+                        task.set_id(f"{runtime['identity']}/{runtime['submit_num']}")
                         submit_num = runtime['submit_num']
                         task_key = (task_name, point, submit_num)
+                        summary = runtime.get('summary', {})
+                        #task._job_runner_name = summary.get('job_runner_name', 'N/A')
+                        task._start_time = summary.get('started_time_string', 'N/A')
+                        task._end_time = summary.get('finished_time_string', 'N/A')
                         
                         if task_key in task_infos:
                             task_info = task_infos[task_key]
-                            #task.set_id(task_info[1])
-                            task._start_time = task_info[0]
-                            task._end_time = task_info[3] if task_info[3] is not None else None
+                            # task._start_time = task_info[0]
+                            # task._end_time = task_info[3] if task_info[3] is not None else None
+                            task._run_platform = task_info[4]
                             task._status = task_info[2]
                             if task_info[5] == "1":
                                 task._manual_submit = "manually submitted"
-                            task._run_platform = task_info[4]
                         
                         data_out = Data(str(uuid4()), get_task_job_job_log(self.workflow, runtime['point'], task_name, submit_num))
                         task.add_output(data_out)
@@ -1961,10 +1963,11 @@ class Scheduler:
                 # If not, initialize it as a new dictionary
                 self.runtime_data[name] = {}
             self.runtime_data[name]['identity'] = name
+            self.runtime_data[name]['summary'] = itask.summary
             self.runtime_data[name]['name'] = itask.tdef.name
             self.runtime_data[name]['point'] = itask.point
             self.runtime_data[name]['submit_num'] = itask.submit_num
-            self.runtime_data[name]['start'] = datetime.now().isoformat()
+            #self.runtime_data[name]['start'] = datetime.now().isoformat()
             
         if (
             self.get_run_mode() == RunMode.SIMULATION
