@@ -123,7 +123,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                                 "name": data_in._name,
                                 "consumer": data_in._consumer
                             }
-                            print(execution_input)
+                            #print(execution_input)
                             
                         for output in await self.context.database.get_output_ports(s.persistent_id):
                             data_out = Data(str(uuid.uuid4()), output["name"])
@@ -134,7 +134,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                                 "name": data_out._name,
                                 "producer": data_out._producer
                             }
-                            print(execution_output)
+                            #print(execution_output)
                             
                         self.prov_workflow.add_task(task)
                         

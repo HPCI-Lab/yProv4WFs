@@ -7,6 +7,7 @@ from uuid import uuid4
 import traceback
 import json
 import os
+import logging
 
 #------------------WORKFLOW------------------–# 
 """
@@ -203,10 +204,23 @@ class Workflow(Node):
 
             doc = preprocess(doc)
             
+            # Configure logging
+            logging.basicConfig(
+                level=logging.DEBUG, 
+                format='%(asctime)s - %(levelname)s - %(message)s - yprov4wfs'
+            )
+
             def convert(obj):
+                logging.debug(f"Converting object: {obj} (type: {type(obj)})")
                 if isinstance(obj, Path):
+                    logging.debug(f"Object is a Path, converting to string: {str(obj)}")
                     return str(obj)
-                raise TypeError("Object of type '%s' is not JSON serializable" % type(obj).__name__)
+                elif obj is None:
+                    logging.debug("Object is None, converting to string 'None'")
+                    return "None"
+                else:
+                    logging.debug(f"Object is of type {type(obj)}, converting to string: {str(obj)}")
+                    return str(obj)
             
             return json.dumps(doc, indent=4, default=convert)
         except Exception as e:
