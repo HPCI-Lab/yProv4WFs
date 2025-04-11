@@ -211,7 +211,7 @@ class Workflow(Node):
             )
 
             def convert(obj):
-                logging.debug(f"Converting object: {obj} (type: {type(obj)})")
+                # logging.debug(f"Converting object: {obj} (type: {type(obj)})")
                 if isinstance(obj, Path):
                     logging.debug(f"Object is a Path, converting to string: {str(obj)}")
                     return str(obj)
@@ -219,8 +219,8 @@ class Workflow(Node):
                     logging.debug("Object is None, converting to string 'None'")
                     return "None"
                 else:
-                    logging.debug(f"Object is of type {type(obj)}, converting to string: {str(obj)}")
-                    return str(obj)
+                    logging.debug(f"Object is of type {type(obj)}")
+                    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
             
             return json.dumps(doc, indent=4, default=convert)
         except Exception as e:

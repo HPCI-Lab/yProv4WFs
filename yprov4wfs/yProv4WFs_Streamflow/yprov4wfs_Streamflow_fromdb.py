@@ -94,10 +94,10 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
             }
             #print(execution_wf)
             
-            for task in wf.steps:
-                if s := wf.steps.get(task):
+            for task_name in wf.steps:
+                if s := wf.steps.get(task_name):
                     for execution_wf in await self.context.database.get_executions_by_step(s.persistent_id):
-                        task = Task(str(uuid.uuid4()), task)
+                        task = Task(str(uuid.uuid4()), task_name)
                         task._start_time = streamflow.core.utils.get_date_from_ns(execution_wf["start_time"])
                         task._end_time = streamflow.core.utils.get_date_from_ns(execution_wf["end_time"])
                         task._status = self._get_action_status(Status(execution_wf["status"]))
