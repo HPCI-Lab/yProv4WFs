@@ -37,6 +37,7 @@ class Data:
         self._agent = None
         self.is_input = False
         self.is_output = False
+        self._info = None
         
     def set_type(self, type: FileType):
         self._type = type
