@@ -7,8 +7,6 @@ from uuid import uuid4
 import traceback
 import json
 import os
-import logging
-
 #------------------WORKFLOW------------------–# 
 """
 Workflow class represents a workflow in the system, inheriting from Node.
@@ -42,6 +40,8 @@ class Workflow(Node):
         self._type = None
         self._engineWMS = None
         self._resource_cwl_uri = None
+        ############# for tracking the data ###########
+        self._data = []
         
     def add_input(self, data: Data):
         data.set_consumer(self)
@@ -61,6 +61,17 @@ class Workflow(Node):
             if task._id == id:
                 return task
         return None
+
+    ################## adding and retriving data from workflow ###########
+    def add_data(self, item):
+        if not isinstance(item, Data):
+            raise TypeError(f"Expected an instance of [yprov4wfs.datamodel.data] Data, got {type(item).__name__}")
+        self._data.append(item)
+
+    def get_data_by_id(self, id):
+        for data in self._data:
+            if data._id == id:
+                return data
 
     # to_prov function without dependences to prov.model library
     def to_prov(self):
@@ -116,7 +127,8 @@ class Workflow(Node):
             
             for task in self._tasks:
                 if task is not None:
-                    doc['activity'][task._id] = {
+                    #doc['activity'][task._id] = {
+                    task_items = {
                         'prov:startTime': task._start_time,
                         'prov:endTime': task._end_time,
                         'prov:label': task._name,
@@ -124,6 +136,12 @@ class Workflow(Node):
                         'yprov4wfs:status': task._status,
                         'yprov4wfs:level': task._level
                     }
+                    ### parse the _info dict to auto extract the metrics
+                    if isinstance(task._info, dict):
+                        for key, value in task._info.items():
+                            if value is not None:
+                                task_items[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))[-60:]
+                    doc['activity'][task._id] = task_items
                     if task._manual_submit is not None:
                         doc['activity'][task._id]['yprov4wfs:manual_submit'] = task._manual_submit
                     if task._run_platform is not None:
@@ -157,22 +175,42 @@ class Workflow(Node):
 
                     for data_item in task._inputs:
                         if data_item is not None:
-                            doc['entity'][data_item._id] = {
+                            #doc['entity'][data_item._id] = {
+                            entity_entry = {
                                 'prov:label': data_item._name,
-                                'prov:type': 'prov:Entity'
+                                'prov:type': 'prov:Entity',
                             }
+                            # parse the _info dict to auto extract the metrics for a data item (inputs)
+                            if isinstance(data_item._info, dict):
+                                for key, value in data_item._info.items():
+                                    if value is not None:
+                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))[-60:]
+
+                            doc['entity'][data_item._id] = entity_entry
                             doc['used'][f'{str(uuid4())}'] = {'prov:activity': task._id, 'prov:entity': data_item._id}
                     for data_item in task._outputs:
                         if data_item is not None:
-                            doc['entity'][data_item._id] = {
+                            #doc['entity'][data_item._id] = {
+                            entity_entry = {
                                 'prov:label': data_item._name,
-                                'prov:type': 'prov:Entity'
+                                'prov:type': 'prov:Entity',
                             }
-                        doc['wasGeneratedBy'][f'{str(uuid4())}'] = {'prov:entity': data_item._id, 'prov:activity': task._id}
+                            if isinstance(data_item._info, dict):
+                                for key, value in data_item._info.items():
+                                    if value is not None:
+                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))[-60:]
 
-                    if task._prev is not None:
-                        for prev_task in task._prev:
-                            doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': prev_task._id}
+                            doc['entity'][data_item._id] = entity_entry
+                            doc['wasGeneratedBy'][f'{str(uuid4())}'] = {'prov:entity': data_item._id, 'prov:activity': task._id}
+
+                    # if task._prev is not None:
+                    #     for prev_task in task._prev:
+                    #         doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': prev_task._id}
+                            
+                    if task._next is not None and not isinstance(task._next, type):
+                        valid_next_tasks = [t for t in task._next if t is not None and not isinstance(t, type)]
+                        for next_task in valid_next_tasks:
+                            doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': next_task._id}
                             
             # Helper function to remove empty lists from the dictionary
             def preprocess(obj):
@@ -203,25 +241,16 @@ class Workflow(Node):
                     return obj
 
             doc = preprocess(doc)
-            
-            # Configure logging
-            logging.basicConfig(
-                level=logging.DEBUG, 
-                format='%(asctime)s - %(levelname)s - %(message)s - yprov4wfs'
-            )
 
             def convert(obj):
-                # logging.debug(f"Converting object: {obj} (type: {type(obj)})")
                 if isinstance(obj, Path):
-                    logging.debug(f"Object is a Path, converting to string: {str(obj)}")
                     return str(obj)
                 elif obj is None:
-                    logging.debug("Object is None, converting to string 'None'")
                     return "None"
                 else:
-                    logging.debug(f"Object is of type {type(obj)}")
-                    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+                    raise TypeError(f"Object {obj} of type {type(obj)} is not JSON serializable")
             
+            # return json.dumps(doc, indent=4, ensure_ascii=False)
             return json.dumps(doc, indent=4, default=convert)
         except Exception as e:
             print(f"Error: {e} ")
@@ -252,3 +281,14 @@ class Workflow(Node):
             traceback.print_exc()
             return None
         
+        
+    # To convert values
+    @staticmethod
+    def convert_value(value):
+        if isinstance(value, float) or isinstance(value, int):
+            return str(value)
+        elif isinstance(value, list):
+            return [Workflow.convert_value(v) for v in value]
+        elif isinstance(value, dict):
+            return {k: Workflow.convert_value(v) for k, v in value.items()}
+        return value  # Return as is if it's already serializable
