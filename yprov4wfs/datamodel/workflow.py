@@ -250,8 +250,8 @@ class Workflow(Node):
                 else:
                     raise TypeError(f"Object {obj} of type {type(obj)} is not JSON serializable")
             
-            # return json.dumps(doc, indent=4, ensure_ascii=False)
-            return json.dumps(doc, indent=4, default=convert)
+            return json.dumps(doc, indent=4, ensure_ascii=False)
+            # return json.dumps(doc, indent=4, default=convert)
         except Exception as e:
             print(f"Error: {e} ")
             traceback.print_exc()
