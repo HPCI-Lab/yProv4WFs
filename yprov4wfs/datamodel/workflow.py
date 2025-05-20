@@ -7,6 +7,14 @@ from uuid import uuid4
 import traceback
 import json
 import os
+import logging
+
+# Set up logging with the requested format
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - yprov4wfs - %(levelname)s - %(message)s'
+)
+
 #------------------WORKFLOW------------------–# 
 """
 Workflow class represents a workflow in the system, inheriting from Node.
@@ -42,40 +50,55 @@ class Workflow(Node):
         self._resource_cwl_uri = None
         ############# for tracking the data ###########
         self._data = []
+        logging.debug("Initialized Workflow with id=%s, name=%s", id, name)
         
     def add_input(self, data: Data):
         data.set_consumer(self)
         if data.is_input:
             self._inputs.append(data)
+        #     logging.info("Added input data: %s", data)
+        # else:
+        #     logging.warning("Tried to add non-input data as input: %s", data)
             
     def add_output(self, data: Data):
         data.set_producer(self)
         if data.is_output:
             self._outputs.append(data)
+            # logging.info("Added output data: %s", data)
+        # else:
+            # logging.warning("Tried to add non-output data as output: %s", data)
             
     def add_task(self, task: Task): 
         self._tasks.append(task)
+        logging.info("Added task: %s", task)
         
     def get_task_by_id(self, id):
         for task in self._tasks:
             if task._id == id:
+                # logging.debug("Found task by id: %s", id)
                 return task
+        # logging.warning("Task not found by id: %s", id)
         return None
 
     ################## adding and retriving data from workflow ###########
     def add_data(self, item):
         if not isinstance(item, Data):
+            # logging.error("Tried to add non-Data item: %r", item)
             raise TypeError(f"Expected an instance of [yprov4wfs.datamodel.data] Data, got {type(item).__name__}")
         self._data.append(item)
+        # logging.info("Added data item: %s", item)
 
     def get_data_by_id(self, id):
         for data in self._data:
             if data._id == id:
+                # logging.debug("Found data by id: %s", id)
                 return data
+        # logging.warning("Data not found by id: %s", id)
 
     # to_prov function without dependences to prov.model library
     def to_prov(self):
         try:
+            logging.debug("Starting to_prov serialization")
             doc = {
                 'prefix': {
                     'default': 'http://anotherexample.org/',
@@ -101,12 +124,16 @@ class Workflow(Node):
                 'yprov4wfs:engine': self._engineWMS,
                 'yprov4wfs:status': self._status,
             }
+            # logging.debug("Added main activity to doc: %s", self._id)
             if self._resource_cwl_uri is not None:
                 doc['activity'][self._id]['yprov4wfs:resource_uri'] = self._resource_cwl_uri
+                # logging.debug("Added resource_cwl_uri: %s", self._resource_cwl_uri)
             if self._type is not None:
                 doc['activity'][self._id]['yprov4wfs:type'] = self._type
+                # logging.debug("Added type: %s", self._type)
             if self._description is not None:
                 doc['activity'][self._id]['yprov4wfs:description'] = self._description
+                # logging.debug("Added description: %s", self._description)
 
 
             for input in self._inputs:
@@ -116,6 +143,7 @@ class Workflow(Node):
                         'prov:type': 'prov:Entity'
                     }
                     doc['used'][f'{str(uuid4())}'] = {'prov:activity': self._id, 'prov:entity': input._id}
+                    # logging.debug("Processed input: %s", input._id)
 
             for output in self._outputs:
                 if output is not None:
@@ -124,6 +152,7 @@ class Workflow(Node):
                         'prov:type': 'prov:Entity'
                     }
                     doc['wasGeneratedBy'][f'{str(uuid4())}'] = {'prov:entity': output._id, 'prov:activity': self._id}
+                    # logging.debug("Processed output: %s", output._id)
             
             for task in self._tasks:
                 if task is not None:
@@ -142,6 +171,7 @@ class Workflow(Node):
                             if value is not None:
                                 task_items[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))[-60:]
                     doc['activity'][task._id] = task_items
+                    # logging.debug("Processed task: %s", task._id)
                     if task._manual_submit is not None:
                         doc['activity'][task._id]['yprov4wfs:manual_submit'] = task._manual_submit
                     if task._run_platform is not None:
@@ -188,6 +218,7 @@ class Workflow(Node):
 
                             doc['entity'][data_item._id] = entity_entry
                             doc['used'][f'{str(uuid4())}'] = {'prov:activity': task._id, 'prov:entity': data_item._id}
+                            # logging.debug("Processed task input: %s", data_item._id)
                     for data_item in task._outputs:
                         if data_item is not None:
                             #doc['entity'][data_item._id] = {
@@ -211,6 +242,7 @@ class Workflow(Node):
                         valid_next_tasks = [t for t in task._next if t is not None and not isinstance(t, type)]
                         for next_task in valid_next_tasks:
                             doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': next_task._id}
+                            # logging.debug("Processed task next: %s", next_task._id)
                             
             # Helper function to remove empty lists from the dictionary
             def preprocess(obj):
@@ -241,6 +273,7 @@ class Workflow(Node):
                     return obj
 
             doc = preprocess(doc)
+            logging.debug("Preprocessed doc for serialization")
 
             def convert(obj):
                 if isinstance(obj, Path):
@@ -248,11 +281,23 @@ class Workflow(Node):
                 elif obj is None:
                     return "None"
                 else:
+                    logging.error(
+                        "JSON serialization error: object=%r, type=%s, location=Workflow.to_prov.convert",
+                        obj, type(obj)
+                    )
                     raise TypeError(f"Object {obj} of type {type(obj)} is not JSON serializable")
             
-            return json.dumps(doc, indent=4, ensure_ascii=False)
-            # return json.dumps(doc, indent=4, default=convert)
+            result = json.dumps(doc, indent=4, ensure_ascii=False, deafult=convert)
+            # result = json.dumps(doc, indent=4, default=convert)
+            logging.info("Successfully serialized workflow to JSON")
+            return result
         except Exception as e:
+            logging.error(
+                "Error in to_prov: %s\nType: %s\nTraceback:\n%s",
+                str(e),
+                type(e).__name__,
+                traceback.format_exc()
+            )
             print(f"Error: {e} ")
             traceback.print_exc()
             return None
@@ -260,28 +305,42 @@ class Workflow(Node):
   
     def prov_to_json(self, directory_path=None):
         try:
+            logging.debug("Starting prov_to_json with directory_path=%s", directory_path)
             if directory_path is None:
                 prov_json = self.to_prov()
                 if prov_json is None:
+                    logging.error("Failed to serialize the document to JSON (to_prov returned None)")
                     raise ValueError("Failed to serialize the document to JSON.")
                 json_file_path = f'yprov4wfs.json'
             else:
                 os.makedirs(directory_path, exist_ok=True)
+                logging.debug("Created directory: %s", directory_path)
                 prov_json = self.to_prov()
                 if prov_json is None:
+                    logging.error("Failed to serialize the document to JSON (to_prov returned None)")
                     raise ValueError("Failed to serialize the document to JSON.")
-                json_file_path = os.path.join(directory_path,f'yprov4wfs.json')
+                json_file_path = os.path.join(directory_path, f'yprov4wfs.json')
 
             with open(json_file_path, 'w') as f:
                 f.write(prov_json)
+                logging.info("Wrote prov JSON to file: %s", json_file_path)
             return json_file_path
 
         except Exception as e:
+            logging.error(
+                "Error in prov_to_json: %s\nType: %s\nTraceback:\n%s",
+                str(e),
+                type(e).__name__,
+                traceback.format_exc()
+            )
+            try:
+                logging.error("prov_json content: %r", prov_json)
+            except Exception:
+                logging.error("prov_json not available or failed to log.")
             print(f"Error: {e} ")
             traceback.print_exc()
             return None
-        
-        
+
     # To convert values
     @staticmethod
     def convert_value(value):

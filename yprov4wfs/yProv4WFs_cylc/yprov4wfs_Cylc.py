@@ -912,7 +912,6 @@ class Scheduler:
             try:
                 self.prov_workflow = await self.populate_prov_workflow(wf_start, wf_stop)
                 self.prov_workflow.prov_to_json(work_dir)
-                print("automatic shutdown, prov is saved")
             except Exception as e:
                 print(f"Error in to_prov: {e}")
                 traceback.print_exc()
