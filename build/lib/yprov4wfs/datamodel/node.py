@@ -9,8 +9,8 @@ class Node:
     def __init__(self, id: str, name: str):
         self._id: str = id
         self._name: str = name
-        self._start_time: datetime | None = None
-        self._end_time: datetime | None = None
+        self._start_time = None
+        self._end_time = None
         self._agent = None
         self._description: str | None = None
         self._status: Any = None
