@@ -116,8 +116,8 @@ class Workflow(Node):
             }
 
             doc['activity'][self._id] = {
-                'prov:startTime': self._start_time,
-                'prov:endTime': self._end_time,
+                'prov:startTime': str(self._start_time),
+                'prov:endTime': str(self._end_time),
                 'prov:label': self._name,
                 'prov:type': 'prov:Activity',
                 'yprov4wfs:level': self._level,
@@ -158,8 +158,8 @@ class Workflow(Node):
                 if task is not None:
                     #doc['activity'][task._id] = {
                     task_items = {
-                        'prov:startTime': task._start_time,
-                        'prov:endTime': task._end_time,
+                        'prov:startTime': str(task._start_time),
+                        'prov:endTime': str(task._end_time),
                         'prov:label': task._name,
                         'prov:type': 'prov:Activity',
                         'yprov4wfs:status': task._status,
