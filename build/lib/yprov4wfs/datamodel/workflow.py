@@ -241,7 +241,7 @@ class Workflow(Node):
                     if task._next is not None and not isinstance(task._next, type):
                         valid_next_tasks = [t for t in task._next if t is not None and not isinstance(t, type)]
                         for next_task in valid_next_tasks:
-                            doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': task._id, 'prov:informant': next_task._id}
+                            doc['wasInformedBy'][f'{str(uuid4())}'] = {'prov:informed': next_task._id, 'prov:informant': task._id}
                             # logging.debug("Processed task next: %s", next_task._id)
                             
             # Helper function to remove empty lists from the dictionary
