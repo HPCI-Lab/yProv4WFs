@@ -303,7 +303,7 @@ class Workflow(Node):
             return None
 
   
-    def prov_to_json(self, directory_path=None):
+    def prov_to_json(self, directory_path=None, file_name=None):
         try:
             logging.debug("Starting prov_to_json with directory_path=%s", directory_path)
             if directory_path is None:
@@ -311,7 +311,7 @@ class Workflow(Node):
                 if prov_json is None:
                     logging.error("Failed to serialize the document to JSON (to_prov returned None)")
                     raise ValueError("Failed to serialize the document to JSON.")
-                json_file_path = f'yprov4wfs.json'
+                json_file_path = file_name or 'yprov4wfs.json'
             else:
                 os.makedirs(directory_path, exist_ok=True)
                 logging.debug("Created directory: %s", directory_path)
@@ -319,7 +319,7 @@ class Workflow(Node):
                 if prov_json is None:
                     logging.error("Failed to serialize the document to JSON (to_prov returned None)")
                     raise ValueError("Failed to serialize the document to JSON.")
-                json_file_path = os.path.join(directory_path, f'yprov4wfs.json')
+                json_file_path = os.path.join(directory_path, file_name or 'yprov4wfs.json')
 
             with open(json_file_path, 'w') as f:
                 f.write(prov_json)
