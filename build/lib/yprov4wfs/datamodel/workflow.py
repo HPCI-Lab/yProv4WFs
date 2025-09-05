@@ -115,25 +115,25 @@ class Workflow(Node):
                 'wasInformedBy': {}
             }
 
-            doc['activity'][self._id] = {
-                'prov:startTime': str(self._start_time),
-                'prov:endTime': str(self._end_time),
-                'prov:label': self._name,
-                'prov:type': 'prov:Activity',
-                'yprov4wfs:level': self._level,
-                'yprov4wfs:engine': self._engineWMS,
-                'yprov4wfs:status': self._status,
-            }
-            # logging.debug("Added main activity to doc: %s", self._id)
-            if self._resource_cwl_uri is not None:
-                doc['activity'][self._id]['yprov4wfs:resource_uri'] = self._resource_cwl_uri
-                # logging.debug("Added resource_cwl_uri: %s", self._resource_cwl_uri)
-            if self._type is not None:
-                doc['activity'][self._id]['yprov4wfs:type'] = self._type
-                # logging.debug("Added type: %s", self._type)
-            if self._description is not None:
-                doc['activity'][self._id]['yprov4wfs:description'] = self._description
-                # logging.debug("Added description: %s", self._description)
+            #doc['activity'][self._id] = {
+            #    'prov:startTime': str(self._start_time),
+            #    'prov:endTime': str(self._end_time),
+            #    'prov:label': self._name,
+            #    'prov:type': 'prov:Activity',
+            #    'yprov4wfs:level': self._level,
+            #    'yprov4wfs:engine': self._engineWMS,
+            #    'yprov4wfs:status': self._status,
+            #}
+            ## logging.debug("Added main activity to doc: %s", self._id)
+            #if self._resource_cwl_uri is not None:
+            #    doc['activity'][self._id]['yprov4wfs:resource_uri'] = self._resource_cwl_uri
+            #    # logging.debug("Added resource_cwl_uri: %s", self._resource_cwl_uri)
+            #if self._type is not None:
+            #    doc['activity'][self._id]['yprov4wfs:type'] = self._type
+            #    # logging.debug("Added type: %s", self._type)
+            #if self._description is not None:
+            #    doc['activity'][self._id]['yprov4wfs:description'] = self._description
+            #    # logging.debug("Added description: %s", self._description)
 
 
             for input in self._inputs:
@@ -169,7 +169,7 @@ class Workflow(Node):
                     if isinstance(task._info, dict):
                         for key, value in task._info.items():
                             if value is not None:
-                                task_items[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))[-60:]
+                                task_items[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
                     doc['activity'][task._id] = task_items
                     # logging.debug("Processed task: %s", task._id)
                     if task._manual_submit is not None:
