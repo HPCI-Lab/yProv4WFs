@@ -109,6 +109,7 @@ class Workflow(Node):
                 'agent': {},
                 'used': {},
                 'wasGeneratedBy': {},
+                'wasDerivedFrom': {},
                 'wasAssociatedWith': {},
                 'wasAttributedTo': {},
                 'actedOnBehalfOf': {},
@@ -203,6 +204,18 @@ class Workflow(Node):
 
                         doc['wasAssociatedWith'][f'{str(uuid4())}'] = {'prov:activity': task._id, 'prov:agent': task._agent._id}
 
+                    for data_item in task._secondary_inputs:
+                        if data_item is not None:
+                            entity_entry = {
+                                'prov:label': data_item._name,
+                                'prov:type': 'prov:Entity',
+                            }
+                            if isinstance(data_item._info, dict):
+                                for key, value in data_item._info.items():
+                                    if value is not None:
+                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
+
+                            doc['entity'][data_item._id] = entity_entry
                     for data_item in task._inputs:
                         if data_item is not None:
                             #doc['entity'][data_item._id] = {
@@ -214,11 +227,16 @@ class Workflow(Node):
                             if isinstance(data_item._info, dict):
                                 for key, value in data_item._info.items():
                                     if value is not None:
-                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))[-60:]
+                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
 
                             doc['entity'][data_item._id] = entity_entry
                             doc['used'][f'{str(uuid4())}'] = {'prov:activity': task._id, 'prov:entity': data_item._id}
                             # logging.debug("Processed task input: %s", data_item._id)
+                            for origin in data_item._origins:
+                                doc['wasDerivedFrom'][f'{str(uuid4())}'] = {
+                                    'prov:generatedEntity': data_item._id,
+                                    'prov:usedEntity': origin._id
+                                }
                     for data_item in task._outputs:
                         if data_item is not None:
                             #doc['entity'][data_item._id] = {
@@ -229,7 +247,7 @@ class Workflow(Node):
                             if isinstance(data_item._info, dict):
                                 for key, value in data_item._info.items():
                                     if value is not None:
-                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))[-60:]
+                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
 
                             doc['entity'][data_item._id] = entity_entry
                             doc['wasGeneratedBy'][f'{str(uuid4())}'] = {'prov:entity': data_item._id, 'prov:activity': task._id}

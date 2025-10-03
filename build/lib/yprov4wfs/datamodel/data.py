@@ -36,6 +36,7 @@ class Data:
         self._type: FileType | str | None = None
         self._producer = None
         self._consumers = []
+        self._origins = []
         self._agent: Agent | None = None
         self._is_input: bool = False
         self._is_output: bool = False
@@ -51,6 +52,9 @@ class Data:
     def add_consumer(self, consumer: Node):
         self._consumers.append(consumer)
         self._is_input = True
+
+    def add_origin(self, origin):
+        self._origins.append(origin)
 
     def is_input(self) -> bool:
         return self._is_input

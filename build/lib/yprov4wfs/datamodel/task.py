@@ -25,6 +25,7 @@ Methods:
 class Task(Node):
     def __init__(self, id: str, name: str):
         super().__init__(id, name)
+        self._secondary_inputs: list[Data] = []
         self._inputs: list[Data] = []
         self._outputs: list[Data] = []
         self._prev: list[Task] = []
@@ -34,6 +35,9 @@ class Task(Node):
         self._delay = None
         self._timeout = None
         self._info: Any = None
+
+    def add_secondary_input(self, data: Data):
+        self._secondary_inputs.append(data)
 
     def add_input(self, data: Data):
         data.add_consumer(self)
