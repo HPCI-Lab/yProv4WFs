@@ -1,7 +1,6 @@
 import os
 from typing import Any
-from yprov4wfs.datamodel.agent import Agent
-from yprov4wfs.datamodel.node import Node
+from yprov4wfs.datamodel.core import Agent, Node
 
 #------------------FileType------------------–#
 class FileType:
@@ -17,8 +16,8 @@ class FileType:
     def mime_type(self) -> str:
         return self._mime_type
 
-    # checks if the extension of a given file matches the expected extension for a specific FileType,
-    # returning True if they match and False otherwise
+    # checks if the extension of a given file matches the expected extension for
+    # a specific FileType, returning True if they match and False otherwise
     def validate(self, file_path) -> bool:
         _, ext = os.path.splitext(file_path)
         return ext.lower() == self._extension
@@ -27,15 +26,16 @@ class FileType:
 #------------------DATA------------------–#
 class Data:
     """
-    Represents a data entity with an ID, name and maintains attributes such as type, producer, consumer,
-    and associated agent. It also tracks whether the data is used as input or outputs.
+    Represents a data entity with an ID, name and maintains attributes such as
+    type, producer, consumer, and associated agent. It also tracks whether the
+    data is used as input or outputs.
     """
     def __init__(self, id: str, name: str):
         self._id: str = id
         self._name: str = name
         self._type: FileType | str | None = None
-        self._producer = None
-        self._consumers = []
+        self._producer: Node | None = None
+        self._consumers: list[Node] = []
         self._origins = []
         self._agent: Agent | None = None
         self._is_input: bool = False

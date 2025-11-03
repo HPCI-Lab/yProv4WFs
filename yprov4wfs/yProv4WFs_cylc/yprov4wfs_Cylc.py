@@ -192,7 +192,7 @@ if TYPE_CHECKING:
 from yprov4wfs.datamodel.workflow import Workflow
 from yprov4wfs.datamodel.task import Task
 from yprov4wfs.datamodel.data import Data, FileType
-from yprov4wfs.datamodel.agent import Agent
+from yprov4wfs.datamodel.core import Agent
 from datetime import datetime
 from cylc.flow.rundb import CylcWorkflowDAO
 from cylc.flow.workflow_status import get_workflow_status

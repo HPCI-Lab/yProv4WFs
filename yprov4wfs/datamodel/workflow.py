@@ -1,4 +1,4 @@
-from yprov4wfs.datamodel.node import Node
+from yprov4wfs.datamodel.core import Node
 from yprov4wfs.datamodel.data import Data
 from yprov4wfs.datamodel.task import Task
 
@@ -16,26 +16,28 @@ logging.basicConfig(
 )
 
 #------------------WORKFLOW------------------–# 
-"""
-Workflow class represents a workflow in the system, inheriting from Node.
-Methods:
-    __init__(id: str, name: str):
-        Initializes a new instance of the Workflow class.
-    add_input(data: Data):
-        Adds an input Data object to the workflow.
-    add_output(data: Data):
-        Adds an output Data object to the workflow.
-    add_task(task: Task):
-        Adds a Task object to the workflow.
-    get_task_by_id(id: str):
-        Retrieves a Task object by its ID.
-    to_prov():
-        Converts the workflow to a PROV document in JSON format without dependencies on the prov.model library.
-    prov_to_json(directory_path: str or None):
-        Serializes the workflow to a JSON file in the specified directory or the current directory if no path is provided.
-"""
-
 class Workflow(Node):
+    """
+    Workflow class represents a workflow in the system, inheriting from Node.
+    Methods:
+        `__init__(id: str, name: str)`:
+            Initializes a new instance of the Workflow class.
+        `add_input(data: Data)`:
+            Adds an input Data object to the workflow.
+        `add_output(data: Data)`:
+            Adds an output Data object to the workflow.
+        `add_task(task: Task)`:
+            Adds a Task object to the workflow.
+        `get_task_by_id(id: str)`:
+            Retrieves a Task object by its ID.
+        `to_prov()`:
+            Converts the workflow to a PROV document in JSON format without
+            dependencies on the prov.model library.
+        `prov_to_json(directory_path: str or None)`:
+            Serializes the workflow to a JSON file in the specified directory or
+            the current directory if no path is provided.
+    """
+
     def __init__(self, id: str, name: str):
         super().__init__(id, name)
         self._inputs: list[Data] = []
@@ -321,7 +323,8 @@ class Workflow(Node):
             return None
 
   
-    def prov_to_json(self, directory_path=None, file_name=None):
+    def prov_to_json(self, directory_path=None, file_name=None) -> str | None:
+        prov_json: str | None = None
         try:
             logging.debug("Starting prov_to_json with directory_path=%s", directory_path)
             if directory_path is None:
