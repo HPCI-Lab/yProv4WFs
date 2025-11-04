@@ -5,6 +5,9 @@ Necessary steps to work with yProv4WFs in Cylc:
 - Clone Cylc repository (inside conda environment preferably):
 -->
 - Install Cylc (inside conda environment preferably):
+> [!IMPORTANT]
+> <sub>This project requires <b>cylc 8.4.0</b> and <b>yprov4wfs 0.0.8</b> for full compatibility.</sub>
+
   - using conda:
     1. create a directory and access it
       * ```bash
@@ -24,12 +27,12 @@ Necessary steps to work with yProv4WFs in Cylc:
   - valid both inside conda or outside:
     1. install cylc-flow via pip
       * ```bash
-        pip install cylc-flow
+        pip install "cylc-flow==8.4.0"
         ```
     2. go to the location of python module
         * verify installation: 
          ```bash
-         pip show cylc-flow
+         pip show cylc-flow 
          ```
         The result should be similiar to this:
          ```bash
@@ -103,25 +106,25 @@ Necessary steps to work with yProv4WFs in Cylc:
     -->
 
 - Using yProv4WFs library (inside conda environment preferably):
-  1. Installing using pip:
+ 1. Installing a specific version using pip:
     * ```bash
-      pip install yprov4wfs
+      pip install "yprov4wfs==0.0.8"
       ```
     * verify installation: 
       ```bash
       pip show yprov4wfs
       ```
-  2. Installing by cloning the repository:
+
+2. Installing by cloning the repository (for development):
     * ```bash
       git clone https://github.com/HPCI-Lab/yProv4WFs.git
-      cd /path/to/your/project
-      ```
-    * ```bash
+      cd yProv4WFs
+      git checkout v.0.0.8
       pip install .
       ```
-  3. Installing from a GitHub Repository:
+3. Installing directly from the GitHub repository (specific version):
     * ```bash
-      pip install git+https://github.com/HPCI-Lab/yProv4WFs.git
+      pip install git+https://github.com/HPCI-Lab/yProv4WFs.git@v.0.0.8
       ```
     * verify installation: 
       ```bash
