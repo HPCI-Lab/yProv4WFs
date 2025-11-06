@@ -1,4 +1,4 @@
-from yprov4wfs.datamodel.node import Node
+from yprov4wfs.datamodel.core import Node
 from yprov4wfs.datamodel.data import Data
 from yprov4wfs.datamodel.task import Task
 
@@ -16,26 +16,28 @@ logging.basicConfig(
 )
 
 #------------------WORKFLOW------------------–# 
-"""
-Workflow class represents a workflow in the system, inheriting from Node.
-Methods:
-    __init__(id: str, name: str):
-        Initializes a new instance of the Workflow class.
-    add_input(data: Data):
-        Adds an input Data object to the workflow.
-    add_output(data: Data):
-        Adds an output Data object to the workflow.
-    add_task(task: Task):
-        Adds a Task object to the workflow.
-    get_task_by_id(id: str):
-        Retrieves a Task object by its ID.
-    to_prov():
-        Converts the workflow to a PROV document in JSON format without dependencies on the prov.model library.
-    prov_to_json(directory_path: str or None):
-        Serializes the workflow to a JSON file in the specified directory or the current directory if no path is provided.
-"""
-
 class Workflow(Node):
+    """
+    Workflow class represents a workflow in the system, inheriting from Node.
+    Methods:
+        `__init__(id: str, name: str)`:
+            Initializes a new instance of the Workflow class.
+        `add_input(data: Data)`:
+            Adds an input Data object to the workflow.
+        `add_output(data: Data)`:
+            Adds an output Data object to the workflow.
+        `add_task(task: Task)`:
+            Adds a Task object to the workflow.
+        `get_task_by_id(id: str)`:
+            Retrieves a Task object by its ID.
+        `to_prov()`:
+            Converts the workflow to a PROV document in JSON format without
+            dependencies on the prov.model library.
+        `prov_to_json(directory_path: str or None)`:
+            Serializes the workflow to a JSON file in the specified directory or
+            the current directory if no path is provided.
+    """
+
     def __init__(self, id: str, name: str):
         super().__init__(id, name)
         self._inputs: list[Data] = []
@@ -109,31 +111,32 @@ class Workflow(Node):
                 'agent': {},
                 'used': {},
                 'wasGeneratedBy': {},
+                'wasDerivedFrom': {},
                 'wasAssociatedWith': {},
                 'wasAttributedTo': {},
                 'actedOnBehalfOf': {},
                 'wasInformedBy': {}
             }
 
-            doc['activity'][self._id] = {
-                'prov:startTime': str(self._start_time),
-                'prov:endTime': str(self._end_time),
-                'prov:label': self._name,
-                'prov:type': 'prov:Activity',
-                'yprov4wfs:level': self._level,
-                'yprov4wfs:engine': self._engineWMS,
-                'yprov4wfs:status': self._status,
-            }
-            # logging.debug("Added main activity to doc: %s", self._id)
-            if self._resource_cwl_uri is not None:
-                doc['activity'][self._id]['yprov4wfs:resource_uri'] = self._resource_cwl_uri
-                # logging.debug("Added resource_cwl_uri: %s", self._resource_cwl_uri)
-            if self._type is not None:
-                doc['activity'][self._id]['yprov4wfs:type'] = self._type
-                # logging.debug("Added type: %s", self._type)
-            if self._description is not None:
-                doc['activity'][self._id]['yprov4wfs:description'] = self._description
-                # logging.debug("Added description: %s", self._description)
+            #doc['activity'][self._id] = {
+            #    'prov:startTime': str(self._start_time),
+            #    'prov:endTime': str(self._end_time),
+            #    'prov:label': self._name,
+            #    'prov:type': 'prov:Activity',
+            #    'yprov4wfs:level': self._level,
+            #    'yprov4wfs:engine': self._engineWMS,
+            #    'yprov4wfs:status': self._status,
+            #}
+            ## logging.debug("Added main activity to doc: %s", self._id)
+            #if self._resource_cwl_uri is not None:
+            #    doc['activity'][self._id]['yprov4wfs:resource_uri'] = self._resource_cwl_uri
+            #    # logging.debug("Added resource_cwl_uri: %s", self._resource_cwl_uri)
+            #if self._type is not None:
+            #    doc['activity'][self._id]['yprov4wfs:type'] = self._type
+            #    # logging.debug("Added type: %s", self._type)
+            #if self._description is not None:
+            #    doc['activity'][self._id]['yprov4wfs:description'] = self._description
+            #    # logging.debug("Added description: %s", self._description)
 
 
             for input in self._inputs:
@@ -169,7 +172,7 @@ class Workflow(Node):
                     if isinstance(task._info, dict):
                         for key, value in task._info.items():
                             if value is not None:
-                                task_items[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))[-60:]
+                                task_items[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
                     doc['activity'][task._id] = task_items
                     # logging.debug("Processed task: %s", task._id)
                     if task._manual_submit is not None:
@@ -203,6 +206,18 @@ class Workflow(Node):
 
                         doc['wasAssociatedWith'][f'{str(uuid4())}'] = {'prov:activity': task._id, 'prov:agent': task._agent._id}
 
+                    for data_item in task._secondary_inputs:
+                        if data_item is not None:
+                            entity_entry = {
+                                'prov:label': data_item._name,
+                                'prov:type': 'prov:Entity',
+                            }
+                            if isinstance(data_item._info, dict):
+                                for key, value in data_item._info.items():
+                                    if value is not None:
+                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
+
+                            doc['entity'][data_item._id] = entity_entry
                     for data_item in task._inputs:
                         if data_item is not None:
                             #doc['entity'][data_item._id] = {
@@ -214,11 +229,16 @@ class Workflow(Node):
                             if isinstance(data_item._info, dict):
                                 for key, value in data_item._info.items():
                                     if value is not None:
-                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))[-60:]
+                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
 
                             doc['entity'][data_item._id] = entity_entry
                             doc['used'][f'{str(uuid4())}'] = {'prov:activity': task._id, 'prov:entity': data_item._id}
                             # logging.debug("Processed task input: %s", data_item._id)
+                            for origin in data_item._origins:
+                                doc['wasDerivedFrom'][f'{str(uuid4())}'] = {
+                                    'prov:generatedEntity': data_item._id,
+                                    'prov:usedEntity': origin._id
+                                }
                     for data_item in task._outputs:
                         if data_item is not None:
                             #doc['entity'][data_item._id] = {
@@ -229,7 +249,7 @@ class Workflow(Node):
                             if isinstance(data_item._info, dict):
                                 for key, value in data_item._info.items():
                                     if value is not None:
-                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))[-60:]
+                                        entity_entry[f'yprov4wfs:{key}'] = str(Workflow.convert_value(value))
 
                             doc['entity'][data_item._id] = entity_entry
                             doc['wasGeneratedBy'][f'{str(uuid4())}'] = {'prov:entity': data_item._id, 'prov:activity': task._id}
@@ -303,7 +323,8 @@ class Workflow(Node):
             return None
 
   
-    def prov_to_json(self, directory_path=None):
+    def prov_to_json(self, directory_path=None, file_name=None) -> str | None:
+        prov_json: str | None = None
         try:
             logging.debug("Starting prov_to_json with directory_path=%s", directory_path)
             if directory_path is None:
@@ -311,7 +332,7 @@ class Workflow(Node):
                 if prov_json is None:
                     logging.error("Failed to serialize the document to JSON (to_prov returned None)")
                     raise ValueError("Failed to serialize the document to JSON.")
-                json_file_path = f'yprov4wfs.json'
+                json_file_path = file_name or 'yprov4wfs.json'
             else:
                 os.makedirs(directory_path, exist_ok=True)
                 logging.debug("Created directory: %s", directory_path)
@@ -319,7 +340,7 @@ class Workflow(Node):
                 if prov_json is None:
                     logging.error("Failed to serialize the document to JSON (to_prov returned None)")
                     raise ValueError("Failed to serialize the document to JSON.")
-                json_file_path = os.path.join(directory_path, f'yprov4wfs.json')
+                json_file_path = os.path.join(directory_path, file_name or 'yprov4wfs.json')
 
             with open(json_file_path, 'w') as f:
                 f.write(prov_json)
