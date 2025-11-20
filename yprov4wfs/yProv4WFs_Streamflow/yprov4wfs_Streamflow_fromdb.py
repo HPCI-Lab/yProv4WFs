@@ -48,6 +48,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
     
 
     async def populate_prov_workflow(self):
+        
         for wf in self.workflows:
             wf_obj = await self.context.database.get_workflow(wf.persistent_id)
             self.prov_workflow = Workflow(wf_obj["name"], f'workflow_{wf_obj["name"]}')
@@ -56,7 +57,10 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
             self.prov_workflow._status = self._get_action_status(Status(wf_obj["status"]))
             self.prov_workflow._engineWMS = 'StreamFlow'
             self.prov_workflow._level = '0'
-            self.prov_workflow._resource_cwl_uri = self.map_file["config"]
+            self.prov_workflow._resource_cwl_uri = self.map_file["config"]           
+            
+            # maps for dependency building for finding the connection between the tasks
+            stepid_to_task: dict[int, Task] = {}
             
             for input in await self.context.database.get_input_ports(wf.persistent_id):
                 data_in = Data(str(uuid.uuid4()), input["name"])
@@ -102,42 +106,83 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                         task._end_time = streamflow.core.utils.get_date_from_ns(execution_wf["end_time"])
                         task._status = self._get_action_status(Status(execution_wf["status"]))
                         task._level = '1'
-                        # task.set_enactor(workflow.get_enactor_by_id(step.enactor_id))
+                        # record mapping from StreamFlow step to Task
+                        # Inside the DB we have the ids for the steps but yprov4wfs works with Task objects
+                        # so we use this Dictionary to map the step ids to the Task objects.
+                        # example: {1: <Task bejct for step 1>, 2: <Task bejct for step 1>}
+                        stepid_to_task[s.persistent_id] = task
+                    
                         
-                        execution_task = {
-                            "id": task._id,
-                            "status": task._status,
-                            "endTime": task._end_time,
-                            "name": task._name,
-                            "startTime": task._start_time,
-                            "level": task._level
-                        }
-                        #print(execution_task)
-                   
-                        for input in await self.context.database.get_input_ports(s.persistent_id):
-                            data_in = Data(str(uuid.uuid4()), input["name"])
+                        # Inputs - they use to create dependencies
+                        input_rows = await self.context.database.get_input_ports(s.persistent_id)
+                        for input_row in input_rows:
+                            data_in = Data(str(uuid.uuid4()), input_row["name"])
                             task.add_input(data_in)
-                            data_in.add_consumer(task._id)
-                            execution_input = {
-                                "id": data_in._id,
-                                "name": data_in._name,
-                                "consumer": data_in._consumers
-                            }
-                            #print(execution_input)
-                            
-                        for output in await self.context.database.get_output_ports(s.persistent_id):
-                            data_out = Data(str(uuid.uuid4()), output["name"])
+                            data_in.add_consumer(task)
+
+                        output_rows = await self.context.database.get_output_ports(s.persistent_id)   
+                        for output_row in output_rows:
+                            data_out = Data(str(uuid.uuid4()), output_row["name"])
                             task.add_output(data_out)
-                            data_out.set_producer(task._id)
-                            execution_output = {
-                                "id": data_out._id,
-                                "name": data_out._name,
-                                "producer": data_out._producer
-                            }
-                            #print(execution_output)
+                            data_out.set_producer(task)
                             
                         self.prov_workflow.add_task(task)
-                        
+            
+            #
+            db = self.context.database
+            # Avoid duplicates 
+            created_edges: set[tuple[str, str]] = set()
+
+            # SECOND LOOP: build dependencies based on the tokens
+            for task_name in wf.steps:
+                if not (s := wf.steps.get(task_name)):
+                    continue
+
+                producer_task = stepid_to_task.get(s.persistent_id)
+                if producer_task is None:
+                    continue
+
+                output_ports = await db.get_output_ports(s.persistent_id)
+                for out_port in output_ports:
+                    port_id = out_port["port"]
+
+
+                    token_ids = await db.get_port_tokens(port_id)
+                    for token_id in token_ids:
+
+                        dependers = await db.get_dependers(token_id)
+
+                        for dep in dependers:
+                            dep_dict = dict(dep)
+                            depender_token_id = dep_dict.get("depender") or dep_dict.get("id")
+                            if depender_token_id is None:
+                                continue
+
+                            depender_port = await db.get_port_from_token(depender_token_id)
+                            if depender_port is None:
+                                print(f"No port found for token {depender_token_id}")
+
+                            depender_port_id = dict(depender_port)["id"]
+
+                            input_steps = await db.get_input_steps(depender_port_id)
+                            for step_row in input_steps:
+                                consumer_step_id = step_row["step"]
+
+                                consumer_task = stepid_to_task.get(consumer_step_id)
+                                if consumer_task is None:
+                                    continue 
+
+                                if consumer_task is producer_task:
+                                    continue 
+
+                                edge_key = (producer_task._id, consumer_task._id)
+                                if edge_key in created_edges:
+                                    continue
+                                created_edges.add(edge_key)
+
+                                consumer_task.add_prev(producer_task)
+                                producer_task.add_next(consumer_task)
+
             return self.prov_workflow
         
         
