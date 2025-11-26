@@ -117,7 +117,10 @@ class Workflow(Node):
                 'actedOnBehalfOf': {},
                 'wasInformedBy': {}
             }
-
+            
+            # Optionally treat the workflow itself as a PROV activity (like a task).
+            # If needed, uncomment this block and the corresponding lines in the input/output sections below.
+            #**** Uncomment only if the workflow itself is represented as a prov:Activity.****
             #doc['activity'][self._id] = {
             #    'prov:startTime': str(self._start_time),
             #    'prov:endTime': str(self._end_time),
@@ -138,23 +141,23 @@ class Workflow(Node):
             #    doc['activity'][self._id]['yprov4wfs:description'] = self._description
             #    # logging.debug("Added description: %s", self._description)
 
-
-            for input in self._inputs:
-                if input is not None:
-                    doc['entity'][input._id] = {
-                        'prov:label': input._name,
-                        'prov:type': 'prov:Entity'
-                    }
-                    doc['used'][f'{str(uuid4())}'] = {'prov:activity': self._id, 'prov:entity': input._id}
+            # for input in self._inputs:
+            #     if input is not None:
+            #         doc['entity'][input._id] = {
+            #             'prov:label': input._name,
+            #             'prov:type': 'prov:Entity'
+            #         }
+                    #doc['used'][f'{str(uuid4())}'] = {'prov:activity': self._id, 'prov:entity': input._id}
                     # logging.debug("Processed input: %s", input._id)
 
-            for output in self._outputs:
-                if output is not None:
-                    doc['entity'][output._id] = {
-                        'prov:label': output._name,
-                        'prov:type': 'prov:Entity'
-                    }
-                    doc['wasGeneratedBy'][f'{str(uuid4())}'] = {'prov:entity': output._id, 'prov:activity': self._id}
+            # for output in self._outputs:
+            #     if output is not None:
+            #         doc['entity'][output._id] = {
+            #             'prov:label': output._name,
+            #             'prov:type': 'prov:Entity'
+                    # }
+
+                    #doc['wasGeneratedBy'][f'{str(uuid4())}'] = {'prov:entity': output._id, 'prov:activity': self._id}
                     # logging.debug("Processed output: %s", output._id)
             
             for task in self._tasks:
