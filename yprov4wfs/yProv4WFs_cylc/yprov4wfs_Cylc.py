@@ -413,9 +413,7 @@ class Scheduler:
 
         """
         self.data_store_mgr = DataStoreMgr(self)
-        self.broadcast_mgr = BroadcastMgr(
-            self.workflow_db_mgr, self.data_store_mgr)
-
+        self.broadcast_mgr = BroadcastMgr(self)
         self.server = WorkflowRuntimeServer(self)
 
         self.proc_pool = SubProcPool()
@@ -453,7 +451,8 @@ class Scheduler:
             self.workflow_db_mgr,
             self.task_events_mgr,
             self.data_store_mgr,
-            self.bad_hosts
+            self.bad_hosts,
+            self.server,
         )
 
         self.profiler = Profiler(self, self.options.profile_mode)
@@ -1695,18 +1694,17 @@ class Scheduler:
         self.task_job_mgr.task_remote_mgr.rsync_includes = (
             self.config.get_validated_rsync_includes())
 
+        submitted = self.task_job_mgr.submit_task_jobs(itasks, self.get_run_mode(), )
+        if not submitted:
+            return False
+
         log = LOG.debug
         if self.options.reftest or self.options.genref:
             log = LOG.info
-        for itask in self.task_job_mgr.submit_task_jobs(
-            self.workflow, #delete in v-8.5.x
-            itasks,
-            self.server.curve_auth,
-            self.server.client_pub_key_dir,
-            run_mode=self.get_run_mode()
-        ):
+
+        for itask in submitted:
             if itask.flow_nums:
-                flow = ','.join(str(i) for i in itask.flow_nums)
+                flow = ",".join(str(i) for i in itask.flow_nums)
             else:
                 flow = FLOW_NONE
             log(
@@ -1714,7 +1712,6 @@ class Scheduler:
                 f"{itask.state.get_resolved_dependencies()} in flow {flow}"
             )
 
-        # one or more tasks were passed through the submission pipeline
         return True
 
     def process_workflow_db_queue(self):
