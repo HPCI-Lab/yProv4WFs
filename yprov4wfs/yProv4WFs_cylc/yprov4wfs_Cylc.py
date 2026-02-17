@@ -19,8 +19,11 @@ import asyncio
 from collections import deque
 from contextlib import suppress
 import itertools
+import json
 import os
 from pathlib import Path
+import re
+import mimetypes
 from queue import (
     Empty,
     Queue,
@@ -199,6 +202,90 @@ from cylc.flow.workflow_status import get_workflow_status
 from cylc.flow.task_job_logs import get_task_job_job_log
 from cylc.flow.scripts.graph import _get_graph_nodes_edges, get_config
 from cylc.flow.pathutil import get_workflow_run_pub_db_path
+
+
+def _parse_meta_list(value):
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith('[') and text.endswith(']'):
+            try:
+                return [str(v) for v in json.loads(text)]
+            except Exception:
+                pass
+        items = []
+        buf = ''
+        in_quotes = False
+        for ch in text:
+            if ch in ('"', "'"):
+                in_quotes = not in_quotes
+            elif ch == ',' and not in_quotes:
+                items.append(buf.strip())
+                buf = ''
+            else:
+                buf += ch
+        if buf:
+            items.append(buf.strip())
+        return [i for i in items if i]
+    return [str(value)]
+
+
+def _expand_vars(path, env):
+    if not path:
+        return path
+    def repl(match):
+        key = match.group(1)
+        return str(env.get(key, match.group(0)))
+    return re.sub(r"\$\{([^}]+)\}", repl, path)
+
+
+def _build_data_info(path):
+    info = {
+        "path": path,
+        "filename": os.path.basename(path),
+        "extension": os.path.splitext(path)[1].lower(),
+    }
+    exists = os.path.exists(path)
+    info["exists"] = exists
+    if exists:
+        try:
+            stat = os.stat(path)
+            info["size_bytes"] = stat.st_size
+            info["mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
+        except Exception:
+            pass
+        mime_type, _ = mimetypes.guess_type(path)
+        if mime_type:
+            info["mime_type"] = mime_type
+    return info
+
+
+def _make_data(path):
+    data = Data(str(uuid4()), str(path))
+    data._info = _build_data_info(str(path))
+    return data
+
+
+def _make_data_items(path):
+    items = []
+    if os.path.isdir(path):
+        # Only keep files from directories (recursive), not directories.
+        try:
+            for root, _dirs, files in os.walk(path):
+                for name in files:
+                    child_path = os.path.join(root, name)
+                    if os.path.isfile(child_path):
+                        items.append(_make_data(child_path))
+        except Exception:
+            pass
+        return items
+    # Only add existing files; skip missing paths.
+    if os.path.isfile(path):
+        items.append(_make_data(path))
+    return items
 
 
 class SchedulerStop(CylcError):
@@ -413,9 +500,7 @@ class Scheduler:
 
         """
         self.data_store_mgr = DataStoreMgr(self)
-        self.broadcast_mgr = BroadcastMgr(
-            self.workflow_db_mgr, self.data_store_mgr)
-
+        self.broadcast_mgr = BroadcastMgr(self)
         self.server = WorkflowRuntimeServer(self)
 
         self.proc_pool = SubProcPool()
@@ -453,7 +538,8 @@ class Scheduler:
             self.workflow_db_mgr,
             self.task_events_mgr,
             self.data_store_mgr,
-            self.bad_hosts
+            self.bad_hosts,
+            self.server,
         )
 
         self.profiler = Profiler(self, self.options.profile_mode)
@@ -764,8 +850,48 @@ class Scheduler:
                             task._status = task_info[2]
                             if task_info[5] == "1":
                                 task._manual_submit = "manually submitted"
+
+                        meta = runtime.get('meta', {})
+                        env = {}
+                        env.update(os.environ)
+                        env.update(runtime.get('environment', {}))
+                        env['CYLC_TASK_CYCLE_POINT'] = str(point)
+                        env['CYCLE_DATE'] = str(point).split('T')[0]
+
+                        for input_path in _parse_meta_list(meta.get('yprov_inputs')):
+                            input_path = _expand_vars(input_path, env)
+                            if input_path:
+                                for item in _make_data_items(input_path):
+                                    task.add_input(item)
+                        for output_path in _parse_meta_list(meta.get('yprov_outputs')):
+                            output_path = _expand_vars(output_path, env)
+                            if output_path:
+                                for item in _make_data_items(output_path):
+                                    task.add_output(item)
+
+                        manifest_path = get_workflow_run_work_dir(
+                            self.workflow,
+                            str(point),
+                            task_name,
+                            "prov_io.json",
+                        )
+                        if os.path.exists(manifest_path):
+                            try:
+                                with open(manifest_path, "r") as mhandle:
+                                    io_data = json.load(mhandle)
+                                for input_path in io_data.get("inputs", []):
+                                    for item in _make_data_items(str(input_path)):
+                                        task.add_input(item)
+                                for output_path in io_data.get("outputs", []):
+                                    for item in _make_data_items(str(output_path)):
+                                        task.add_output(item)
+                            except Exception as exc:
+                                print(
+                                    "Error reading provenance manifest "
+                                    f"{manifest_path}: {exc}"
+                                )
                         
-                        data_out = Data(str(uuid4()), get_task_job_job_log(self.workflow, runtime['point'], task_name, submit_num))
+                        data_out = _make_data(get_task_job_job_log(self.workflow, runtime['point'], task_name, submit_num))
                         task.add_output(data_out)
                         data_out.set_producer(task._id)
                         
@@ -779,8 +905,8 @@ class Scheduler:
                 right_task = task_map.get(right)
                 
                 if right and left:
-                    left_task.add_prev(right_task)
-                    right_task.add_next(left_task)
+                    left_task.add_next(right_task)
+                    right_task.add_prev(left_task)
             
             self.prov_workflow._end_time = end
             self.prov_workflow._status = str(get_workflow_status(self))
@@ -800,8 +926,7 @@ class Scheduler:
             
             return self.prov_workflow
         except Exception as e:
-            print(f"Error in populate_prov_workflow: {e}")
-            traceback.print_exc()
+            LOG.exception("Error in populate_prov_workflow: %s", e)
             return None
     
     # run scheduler + provenance tracking (yProv4WFs)
@@ -869,12 +994,15 @@ class Scheduler:
                 work_dir = get_workflow_run_dir(self.workflow)
                 try:
                     self.prov_workflow = await self.populate_prov_workflow(wf_start, wf_stop)
-                    self.prov_workflow.prov_to_json(work_dir)
-                    print("if manually stopped prov is saved")
+                    json_path = self.prov_workflow.prov_to_json(work_dir)
+                    if json_path:
+                        LOG.info("yProv4WFs wrote provenance JSON: %s", json_path)
+                    else:
+                        LOG.error("yProv4WFs failed to write provenance JSON")
+                    LOG.info("yProv4WFs: manual stop provenance save attempted")
                     #TODO understand how to save this info
                 except Exception as e:
-                    print(f"Error in to_prov: {e}")
-                    traceback.print_exc()
+                    LOG.exception("Error in to_prov: %s", e)
                     return None
             except Exception as exc:
                 # Need to log traceback manually because otherwise this
@@ -911,10 +1039,13 @@ class Scheduler:
             work_dir = get_workflow_run_dir(self.workflow)
             try:
                 self.prov_workflow = await self.populate_prov_workflow(wf_start, wf_stop)
-                self.prov_workflow.prov_to_json(work_dir)
+                json_path = self.prov_workflow.prov_to_json(work_dir)
+                if json_path:
+                    LOG.info("yProv4WFs wrote provenance JSON: %s", json_path)
+                else:
+                    LOG.error("yProv4WFs failed to write provenance JSON")
             except Exception as e:
-                print(f"Error in to_prov: {e}")
-                traceback.print_exc()
+                LOG.exception("Error in to_prov: %s", e)
                 return None
             
             self.profiler.stop()
@@ -1651,10 +1782,11 @@ class Scheduler:
             if not self.is_paused:
                 # release queued tasks
                 pre_prep_tasks.update(self.pool.release_queued_tasks())
-                if self.pool.tasks_to_trigger_on_resume:
-                    # and manually triggered tasks to run once workflow resumed
-                    pre_prep_tasks.update(self.pool.tasks_to_trigger_on_resume)
-                    self.pool.tasks_to_trigger_on_resume = set()
+                if hasattr(self.pool, "tasks_to_trigger_on_resume"):
+                    if self.pool.tasks_to_trigger_on_resume:
+                        # and manually triggered tasks to run once workflow resumed
+                        pre_prep_tasks.update(self.pool.tasks_to_trigger_on_resume)
+                        self.pool.tasks_to_trigger_on_resume = set()
 
         elif (
             (
@@ -1695,18 +1827,17 @@ class Scheduler:
         self.task_job_mgr.task_remote_mgr.rsync_includes = (
             self.config.get_validated_rsync_includes())
 
+        submitted = self.task_job_mgr.submit_task_jobs(itasks, self.get_run_mode(), )
+        if not submitted:
+            return False
+
         log = LOG.debug
         if self.options.reftest or self.options.genref:
             log = LOG.info
-        for itask in self.task_job_mgr.submit_task_jobs(
-            self.workflow, #delete in v-8.5.x
-            itasks,
-            self.server.curve_auth,
-            self.server.client_pub_key_dir,
-            run_mode=self.get_run_mode()
-        ):
+
+        for itask in submitted:
             if itask.flow_nums:
-                flow = ','.join(str(i) for i in itask.flow_nums)
+                flow = ",".join(str(i) for i in itask.flow_nums)
             else:
                 flow = FLOW_NONE
             log(
@@ -1714,7 +1845,6 @@ class Scheduler:
                 f"{itask.state.get_resolved_dependencies()} in flow {flow}"
             )
 
-        # one or more tasks were passed through the submission pipeline
         return True
 
     def process_workflow_db_queue(self):
@@ -1755,9 +1885,12 @@ class Scheduler:
         self.check_workflow_timers()
         # check submission and execution timeout and polling timers
         if self.get_run_mode() != RunMode.SIMULATION:
-            self.task_job_mgr.check_task_jobs(self.workflow, self.pool)
-            # version 8.5.x
-            # self.task_job_mgr.check_task_jobs(self.pool)
+            try:
+                # Cylc 8.6.x signature
+                self.task_job_mgr.check_task_jobs(self.workflow, self.pool)
+            except TypeError:
+                # Older signature
+                self.task_job_mgr.check_task_jobs(self.pool)
     async def workflow_shutdown(self):
         """Determines if the workflow can be shutdown yet."""
         if self.pool.check_abort_on_task_fails():
@@ -1966,6 +2099,8 @@ class Scheduler:
             self.runtime_data[name]['name'] = itask.tdef.name
             self.runtime_data[name]['point'] = itask.point
             self.runtime_data[name]['submit_num'] = itask.submit_num
+            self.runtime_data[name]['meta'] = itask.tdef.rtconfig.get('meta', {})
+            self.runtime_data[name]['environment'] = itask.tdef.rtconfig.get('environment', {})
             #self.runtime_data[name]['start'] = datetime.now().isoformat()
             
         if (
