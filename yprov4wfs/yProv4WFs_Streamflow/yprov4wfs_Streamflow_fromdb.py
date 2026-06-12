@@ -1,30 +1,30 @@
 """
 This version includes the fix for generating a 
 connected graph even in the presence of nested sub-workflows.
+
+Moreover, the version excludes from the generated JSON provenance file
+the 'level 0' node.
 """
 
 import os
 import os.path
 import uuid
-import asyncio
+import json
 import yaml
 from abc import abstractmethod
 from zipfile import ZipFile
 from typing import Any, MutableMapping, MutableSequence, Optional
 
 import streamflow.core.utils
-import streamflow.cwl.utils
 from streamflow.core.provenance import ProvenanceManager
 from streamflow.core.workflow import Status, Workflow as StreamFlowWorkflow
 from streamflow.core.context import StreamFlowContext
-from streamflow.core.exception import WorkflowProvenanceException
 from streamflow.core.persistence import DatabaseLoadingContext
 from streamflow.log_handler import logger
 
 from yprov4wfs.datamodel.workflow import Workflow
 from yprov4wfs.datamodel.task import Task
-from yprov4wfs.datamodel.data import Data, FileType
-from yprov4wfs.datamodel.agent import Agent 
+from yprov4wfs.datamodel.data import Data
 
 class yProv4WFsProvenanceManager(ProvenanceManager):
     def __init__(
@@ -248,31 +248,89 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                                         c_task.add_next(p_task)
 
             return self.prov_workflow
-        
+
     async def create_archive(
-        self,
-        outdir: str,
-        filename: Optional[str],
-        config: Optional[str],
-        additional_files: Optional[MutableSequence[MutableMapping[str, str]]],
-        additional_properties: Optional[MutableSequence[MutableMapping[str, str]]],
-    ):
-        if config is not None:
-            self.map_file["config"] = config
-        
-        self.prov_workflow = await self.populate_prov_workflow() 
-                    
-        os.makedirs(outdir, exist_ok=True)
-        path = os.path.join(outdir, filename or (self.workflows[0].name + ".zip"))
-        
-        with ZipFile(path, "w") as archive:
+            self,
+            outdir: str,
+            filename: Optional[str],
+            config: Optional[str],
+            additional_files: Optional[MutableSequence[MutableMapping[str, str]]],
+            additional_properties: Optional[MutableSequence[MutableMapping[str, str]]],
+        ):
+            if config is not None:
+                self.map_file["config"] = config
+            
+            self.prov_workflow = await self.populate_prov_workflow() 
+                        
+            os.makedirs(outdir, exist_ok=True)
+            path = os.path.join(outdir, filename or (self.workflows[0].name + ".zip"))
+            
+            # Generate the initial JSON file using the native method
             json_file_path = self.prov_workflow.prov_to_json()  
-            archive.write(json_file_path, arcname="provenance.json")  
-            for src, dst in self.map_file.items():
-                if os.path.exists(src):
-                    if dst not in archive.namelist():
-                        archive.write(src, dst)
-                else:
-                    logger.warning(f"File {src} does not exist.")
-        
-        print(f"Successfully created yProv4WFs archive at {path}")
+            
+            # ----------------------------------------------------------------------
+            # PURGE LEVEL 0 ACTIVITY + ASSOCIATED ENTITIES
+            # ----------------------------------------------------------------------
+            try:
+                with open(json_file_path, 'r') as f:
+                    prov_data = json.load(f)
+                
+                level_0_id = getattr(self.prov_workflow, '_id', None)
+                
+                if level_0_id:
+                    entities_to_purge = set()
+
+                    # Scan relationships to identify all entity IDs linked to level 0
+                    if "used" in prov_data:
+                        for rel in prov_data["used"].values():
+                            if rel.get("prov:activity") == level_0_id and "prov:entity" in rel:
+                                entities_to_purge.add(rel["prov:entity"])
+                                
+                    if "wasGeneratedBy" in prov_data:
+                        for rel in prov_data["wasGeneratedBy"].values():
+                            if rel.get("prov:activity") == level_0_id and "prov:entity" in rel:
+                                entities_to_purge.add(rel["prov:entity"])
+
+                    # Delete the identified entities from the 'entity' block
+                    if "entity" in prov_data:
+                        for ent_id in entities_to_purge:
+                            if ent_id in prov_data["entity"]:
+                                del prov_data["entity"][ent_id]
+                        logger.info(f"YPROV: Purged {len(entities_to_purge)} level 0 entities.")
+
+                    # Delete the level 0 activity itself
+                    if "activity" in prov_data and level_0_id in prov_data["activity"]:
+                        del prov_data["activity"][level_0_id]
+                        logger.info(f"YPROV: Purged level 0 activity '{level_0_id}'.")
+
+                    # Clean up all relationship edges involving the level 0 node
+                    for rel_type in ["wasInformedBy", "used", "wasGeneratedBy", "wasAssociatedWith"]:
+                        if rel_type in prov_data:
+                            keys_to_delete = [
+                                k for k, v in prov_data[rel_type].items() 
+                                if v.get("prov:activity") == level_0_id or 
+                                v.get("prov:informant") == level_0_id or 
+                                v.get("prov:informed") == level_0_id
+                            ]
+                            for k in keys_to_delete:
+                                del prov_data[rel_type][k]
+                                
+                    # Write the completely sanitized structure back to JSON
+                    with open(json_file_path, 'w') as f:
+                        json.dump(prov_data, f, indent=4)
+                        
+            except Exception as e:
+                logger.warning(f"YPROV: Failed to execute total purge of level 0: {e}")
+            # ----------------------------------------------------------------------
+
+            # Proceed with zipping the clean JSON file
+            with ZipFile(path, "w") as archive:
+                archive.write(json_file_path, arcname="provenance.json")  
+                for src, dst in self.map_file.items():
+                    if os.path.exists(src):
+                        if dst not in archive.namelist():
+                            archive.write(src, dst)
+                    else:
+                        logger.warning(f"File {src} does not exist.")
+            
+            print(f"Successfully created yProv4WFs archive at {path}")
