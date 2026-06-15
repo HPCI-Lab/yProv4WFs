@@ -182,7 +182,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                 for input in inputs:
                     data_in = Data(str(uuid.uuid4()), input["name"])
                     self.prov_workflow.add_input(data_in)
-                    data_in.set_consumer(self.prov_workflow._id)
+                    data_in.add_consumer(self.prov_workflow._id)
                 
                 for output in outputs:
                     data_out = Data(str(uuid.uuid4()), output["name"])
@@ -216,7 +216,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                         for input_port in inputs:
                             data_in = Data(str(uuid.uuid4()), input_port["name"])
                             task.add_input(data_in)
-                            data_in.set_consumer(task._id)
+                            data_in.add_consumer(task._id)
 
                         outputs = await self.context.database.get_output_ports(s.persistent_id)
                         for output_port in outputs:
