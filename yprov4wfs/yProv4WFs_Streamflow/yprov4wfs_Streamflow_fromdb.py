@@ -58,11 +58,19 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         """
         dependencies = {}
 
-        # Get all cwl files in the current folder, if present
-        cwl_files = [f for f in os.listdir('.') if f.endswith('.cwl')]
+        # Recursively find all cwl files in the current folder and any subfolders
+        cwl_files = []
+        for root, dirs, files in os.walk('.'):
+            for file in files:
+                if file.endswith('.cwl'):
+                    cwl_files.append(os.path.join(root, file))
+
         if not cwl_files:
-            logger.warning("YPROV: No CWL file found in the current directory.")
+            logger.warning("YPROV: No CWL file found in the current directory or subdirectories.")
             return dependencies
+        
+        # Log all discovered CWL files to make debugging subfolders transparent
+        logger.info(f"YPROV: Discovered CWL files for parsing: {cwl_files}")
         
         # map out all short names to their absolute execution paths
         # this is to make a clear mapping between the "absolute" path stored in 
@@ -77,7 +85,10 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
 
         for filename in cwl_files:
             try:
-                with open(filename, 'r') as f:
+                # Normalize path to prevent string comparison bugs in nested directories
+                absolute_target_path = os.path.abspath(filename)
+                
+                with open(absolute_target_path, 'r') as f:
                     data = yaml.safe_load(f)
                 if data.get('class') != 'Workflow': 
                     continue
