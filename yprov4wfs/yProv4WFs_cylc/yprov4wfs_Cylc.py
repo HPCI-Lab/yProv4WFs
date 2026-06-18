@@ -18,16 +18,21 @@
 import asyncio
 from collections import deque
 from contextlib import suppress
+from datetime import datetime
+import inspect
 import itertools
+import json
+import logging
+import mimetypes
 import os
 from pathlib import Path
+import re
 from queue import (
     Empty,
     Queue,
 )
 from shlex import quote
 import signal
-from socket import gaierror
 from subprocess import (
     DEVNULL,
     PIPE,
@@ -50,6 +55,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Literal,
     NoReturn,
     Optional,
     Set,
@@ -58,11 +64,13 @@ from typing import (
 )
 from uuid import uuid4
 
+from metomi.isodatetime.exceptions import TimePointDumperBoundsError
 import psutil
 
 from cylc.flow import (
     LOG,
     __version__ as CYLC_VERSION,
+    command_validation,
     commands,
     main_loop,
     workflow_files,
@@ -81,7 +89,7 @@ from cylc.flow.flow_mgr import (
     FLOW_NEW,
     FLOW_NONE,
     FlowMgr,
-    repr_flow_nums,
+    stringify_flow_nums,
 )
 from cylc.flow.host_select import (
     HostSelectException,
@@ -108,8 +116,8 @@ from cylc.flow.loggingutil import (
 from cylc.flow.network import API
 from cylc.flow.network.authentication import key_housekeeping
 from cylc.flow.network.server import WorkflowRuntimeServer
-from cylc.flow.parsec.OrderedDict import DictTree
 from cylc.flow.parsec.exceptions import ParsecError
+from cylc.flow.parsec.OrderedDict import DictTree
 from cylc.flow.parsec.validate import DurationFloat
 from cylc.flow.pathutil import (
     get_workflow_name_from_id,
@@ -152,10 +160,7 @@ from cylc.flow.task_state import (
     TASK_STATUSES_ACTIVE,
     TASK_STATUSES_NEVER_ACTIVE,
 )
-from cylc.flow.taskdef import (
-    TaskDef,
-    generate_graph_children,
-)
+from cylc.flow.taskdef import TaskDef
 from cylc.flow.templatevars import (
     eval_var,
     get_template_vars,
@@ -179,12 +184,6 @@ from cylc.flow.xtrigger_mgr import XtriggerManager
 if TYPE_CHECKING:
     from optparse import Values
 
-    # BACK COMPAT: typing_extensions.Literal
-    # FROM: Python 3.7
-    # TO: Python 3.8
-    from typing_extensions import Literal
-
-    from cylc.flow.flow_mgr import FlowNums
     from cylc.flow.network.resolvers import TaskMsg
     from cylc.flow.task_proxy import TaskProxy
 
@@ -193,12 +192,167 @@ from yprov4wfs.datamodel.workflow import Workflow
 from yprov4wfs.datamodel.task import Task
 from yprov4wfs.datamodel.data import Data, FileType
 from yprov4wfs.datamodel.core import Agent
-from datetime import datetime
 from cylc.flow.rundb import CylcWorkflowDAO
 from cylc.flow.workflow_status import get_workflow_status
 from cylc.flow.task_job_logs import get_task_job_job_log
 from cylc.flow.scripts.graph import _get_graph_nodes_edges, get_config
 from cylc.flow.pathutil import get_workflow_run_pub_db_path
+
+
+def _parse_meta_list(value):
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith('[') and text.endswith(']'):
+            try:
+                return [str(v) for v in json.loads(text)]
+            except Exception:
+                pass
+        items = []
+        buf = ''
+        in_quotes = False
+        for ch in text:
+            if ch in ('"', "'"):
+                in_quotes = not in_quotes
+            elif ch == ',' and not in_quotes:
+                items.append(buf.strip())
+                buf = ''
+            else:
+                buf += ch
+        if buf:
+            items.append(buf.strip())
+        return [i for i in items if i]
+    return [str(value)]
+
+
+def _expand_vars(path, env):
+    if not path:
+        return path
+
+    def repl(match):
+        key = match.group(1)
+        return str(env.get(key, match.group(0)))
+    return re.sub(r"\$\{([^}]+)\}", repl, path)
+
+
+def _build_data_info(path):
+    info = {
+        "path": path,
+        "filename": os.path.basename(path),
+        "extension": os.path.splitext(path)[1].lower(),
+    }
+    exists = os.path.exists(path)
+    info["exists"] = exists
+    if exists:
+        try:
+            stat = os.stat(path)
+            info["size_bytes"] = stat.st_size
+            info["mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
+        except Exception:
+            pass
+        mime_type, _ = mimetypes.guess_type(path)
+        if mime_type:
+            info["mime_type"] = mime_type
+    return info
+
+
+def _make_data(path):
+    data = Data(str(uuid4()), str(path))
+    data._info = _build_data_info(str(path))
+    return data
+
+
+def _make_data_items(path):
+    items = []
+    if os.path.isdir(path):
+        try:
+            for root, _dirs, files in os.walk(path):
+                for name in files:
+                    child_path = os.path.join(root, name)
+                    if os.path.isfile(child_path):
+                        items.append(_make_data(child_path))
+        except Exception:
+            pass
+        return items
+    if os.path.isfile(path):
+        items.append(_make_data(path))
+    return items
+
+
+def _coerce_submit_num(value) -> int:
+    """Return submit numbers as integers, defaulting invalid placeholders to 0."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _select_runtime_entries(
+    runtime_data: Dict[str, Dict[str, Any]],
+    task_name: str,
+    point: str,
+) -> List[Dict[str, Any]]:
+    """Return real runtime entries for a task/cycle, ignoring NN-style placeholders."""
+    matches = [
+        runtime
+        for runtime in runtime_data.values()
+        if runtime.get('name') == task_name and str(runtime.get('point')) == point
+    ]
+    if not matches:
+        return []
+    real_matches = [
+        runtime for runtime in matches
+        if _coerce_submit_num(runtime.get('submit_num')) > 0
+    ]
+    return sorted(
+        real_matches,
+        key=lambda runtime: _coerce_submit_num(runtime.get('submit_num'))
+    )
+
+
+def _select_runtime_context(
+    runtime_data: Dict[str, Dict[str, Any]],
+    task_name: str,
+    point: str,
+) -> Dict[str, Any]:
+    """Return the best available runtime context for a task/cycle."""
+    runtimes = _select_runtime_entries(runtime_data, task_name, point)
+    if runtimes:
+        return runtimes[-1]
+    fallback = [
+        runtime
+        for runtime in runtime_data.values()
+        if runtime.get('name') == task_name and str(runtime.get('point')) == point
+    ]
+    if fallback:
+        return fallback[-1]
+    return {}
+
+
+def _derive_job_status(
+    submit_status: Any,
+    run_status: Any,
+    run_signal: Any,
+    time_run: Any,
+    time_run_exit: Any,
+) -> str:
+    """Return the real execution status of a task job from task_jobs fields."""
+    submit_status = _coerce_submit_num(submit_status)
+    run_status = _coerce_submit_num(run_status)
+    run_signal = str(run_signal or "").strip()
+
+    if submit_status != 0:
+        return "submit-failed"
+    if run_signal or run_status != 0:
+        return "failed"
+    if time_run and time_run_exit:
+        return "succeeded"
+    if time_run:
+        return "running"
+    return "submitted"
 
 
 class SchedulerStop(CylcError):
@@ -224,6 +378,7 @@ class Scheduler:
     # Intervals in seconds
     INTERVAL_MAIN_LOOP = 1.0
     INTERVAL_MAIN_LOOP_QUICK = 0.5
+    INTERVAL_PROV_SNAPSHOT = 10.0
     INTERVAL_STOP_KILL = 10.0
     INTERVAL_STOP_PROCESS_POOL_EMPTY = 0.5
     INTERVAL_AUTO_RESTART_ERROR = 5
@@ -314,10 +469,15 @@ class Scheduler:
     count: int = 0
 
     time_next_kill: Optional[float] = None
-    
+
     def __init__(self, id_: str, options: 'Values') -> None:
+        # provenance tracking (yProv4WFs)
+        self.runtime_data: Dict[str, Dict[str, Any]] = {}
+        self._prov_workflow_start: Optional[str] = None
+        self._last_prov_snapshot_time: float = 0.0
+        self._prov_snapshot_requested = False
+        self._prov_final_snapshot_saved = False
         # flow information
-        self.runtime_data = {} # dictionary to store runtime data for provenance
         self.workflow = id_
         self.workflow_name = get_workflow_name_from_id(self.workflow)
         self.owner = get_user()
@@ -413,8 +573,7 @@ class Scheduler:
 
         """
         self.data_store_mgr = DataStoreMgr(self)
-        self.broadcast_mgr = BroadcastMgr(
-            self.workflow_db_mgr, self.data_store_mgr)
+        self.broadcast_mgr = BroadcastMgr(self)
 
         self.server = WorkflowRuntimeServer(self)
 
@@ -425,12 +584,7 @@ class Scheduler:
         self.workflow_event_handler = WorkflowEventHandler(self.proc_pool)
 
         self.xtrigger_mgr = XtriggerManager(
-            self.workflow,
-            user=self.owner,
-            broadcast_mgr=self.broadcast_mgr,
-            workflow_db_mgr=self.workflow_db_mgr,
-            data_store_mgr=self.data_store_mgr,
-            proc_pool=self.proc_pool,
+            self,
             workflow_run_dir=self.workflow_run_dir,
             workflow_share_dir=self.workflow_share_dir,
         )
@@ -453,7 +607,8 @@ class Scheduler:
             self.workflow_db_mgr,
             self.task_events_mgr,
             self.data_store_mgr,
-            self.bad_hosts
+            self.bad_hosts,
+            self.server,
         )
 
         self.profiler = Profiler(self, self.options.profile_mode)
@@ -486,6 +641,10 @@ class Scheduler:
                     f"{og_run_mode.value} mode:"
                     f" You can't restart it in {run_mode.value} mode."
                 )
+
+        if self.options.paused_start:
+            self.pause_workflow('Paused on start up')
+
         self.profiler.log_memory("scheduler.py: before load_flow_file")
         try:
             cfg = self.load_flow_file()
@@ -571,8 +730,22 @@ class Scheduler:
                     timer.reset()
                 self.timers[event] = timer
 
-        if self.is_restart and not self.pool.get_tasks():
-            # This workflow completed before restart; wait for intervention.
+        if self.is_restart and (
+            # workflow has completed
+            not self.pool.get_tasks()
+            # workflow has hit the "stop after cycle point"
+            or (
+                self.config.stop_point
+                and all(
+                    cycle > self.config.stop_point
+                    for cycle in {
+                        itask.point for itask in self.pool.get_tasks()
+                    }
+                )
+            )
+        ):
+            # This workflow will shut down immediately once restarted
+            # => Give the user a grace period to intervene first
             with suppress(KeyError):
                 self.timers[self.EVENT_RESTART_TIMEOUT].reset()
                 self.is_restart_timeout_wait = True
@@ -595,9 +768,6 @@ class Scheduler:
             holdcp = self.config.cfg['scheduling']['hold after cycle point']
         if holdcp is not None:
             await commands.run_cmd(commands.set_hold_point(self, holdcp))
-
-        if self.options.paused_start:
-            self.pause_workflow('Paused on start up')
 
         self.profiler.log_memory("scheduler.py: begin run while loop")
         self.is_updated = True
@@ -673,65 +843,62 @@ class Scheduler:
                     f'Stop point: {self.config.stop_point}',
                     extra=RotatingLogFileHandler.header_extra
                 )
-    # task information for task provenance (yProv4WFs)
+
     async def get_task_infos(self, workflow_id):
-        """Retrieve detailed task information including time_run, time_run_exit, run_status, and related state details for each task and cycle."""
+        """Retrieve task-job information for real provenance status.
+
+        Uses task_jobs as the source of truth for job attempts so that
+        failed/retried attempts are preserved.
+        """
         query = """
-            SELECT 
-                task_jobs.name, 
-                task_jobs.cycle, 
-                task_jobs.submit_num, 
-                task_jobs.time_run, 
-                task_jobs.time_run_exit, 
-                task_jobs.platform_name, 
+            SELECT
+                task_jobs.name,
+                task_jobs.cycle,
+                task_jobs.submit_num,
+                task_jobs.time_run,
+                task_jobs.time_run_exit,
+                task_jobs.platform_name,
                 task_jobs.job_id,
                 task_jobs.flow_nums,
-                task_states.status, 
-                task_states.is_manual_submit
-            FROM 
+                task_jobs.is_manual_submit,
+                task_jobs.submit_status,
+                task_jobs.run_status,
+                task_jobs.run_signal
+            FROM
                 task_jobs
-            INNER JOIN 
-                task_states 
-            ON 
-                task_jobs.name = task_states.name
-                AND task_jobs.cycle = task_states.cycle
-                AND task_jobs.flow_nums = task_states.flow_nums
         """
-        #         AND task_jobs.submit_num = task_states.submit_num
-        # """
-        
-        with CylcWorkflowDAO(get_workflow_run_pub_db_path(workflow_id), is_public=True) as dao:
+        with CylcWorkflowDAO(
+            get_workflow_run_pub_db_path(workflow_id), is_public=True
+        ) as dao:
             results = list(dao.connect().execute(query))
-    
-        task_info = {
+
+        return {
             (row[0], row[1], row[2]): (
-                row[3],  # time_run
-                row[6],  # job_id
-                row[8],  # run_status
-                row[4],  # time_run_exit
-                row[5],  # platform_name
-                row[9]   # is_manual_submit
+                row[3],   # time_run
+                row[6],   # job_id
+                _derive_job_status(row[9], row[10], row[11], row[3], row[4]),
+                row[4],   # time_run_exit
+                row[5],   # platform_name
+                row[8],   # is_manual_submit
             )
             for row in results
         }
-        
-        return task_info
 
-    
-    # provenance json creation (yProv4WFs)
     async def populate_prov_workflow(self, start: str, end: str):
+        """Build and return a Workflow provenance object for the current run."""
         try:
             self.prov_workflow = Workflow(self.uuid_str, self.workflow)
             self.prov_workflow._start_time = start
             self.prov_workflow._engineWMS = 'Cylc'
             self.prov_workflow._level = '0'
-            self.prov_workflow._resource_cwl_uri = workflow_files.get_flow_file(self.workflow)
+            self.prov_workflow._resource_cwl_uri = workflow_files.get_flow_file(
+                self.workflow)
             self.prov_workflow._type = str(self.get_run_mode())
-            
+
             data_in = Data(str(uuid4()), workflow_files.get_flow_file(self.workflow))
             self.prov_workflow.add_input(data_in)
             data_in.add_consumer(self.prov_workflow._id)
-            
+
             task_infos = await self.get_task_infos(self.workflow)
             config = get_config(self.workflow, self.options, self.flow_file)
             stp = self.config.cfg['scheduling']['initial cycle point']
@@ -739,72 +906,139 @@ class Scheduler:
             nodes, edges = _get_graph_nodes_edges(config, stp, ftp)
 
             task_map: Dict[str, Task] = {}
-            
+            task_attempts: Dict[Tuple[str, str], List[Tuple[int, Tuple[Any, ...]]]] = {}
+            for (task_name, point, submit_num), info in task_infos.items():
+                submit_num = _coerce_submit_num(submit_num)
+                if submit_num <= 0:
+                    continue
+                task_attempts.setdefault((task_name, str(point)), []).append(
+                    (submit_num, info)
+                )
+            for attempts in task_attempts.values():
+                attempts.sort(key=lambda item: item[0])
+
             for node in nodes:
                 tokens = Tokens(node, relative=True)
                 task_name = tokens['task']
-                point = tokens['cycle']
-                task = Task(str(uuid4()), task_name)
-                task._level = '1'
-                for key, runtime in self.runtime_data.items():
-                    if runtime['name'] == task_name and str(runtime['point']) == point:
-                        task.set_id(f"{runtime['identity']}/{runtime['submit_num']}")
-                        submit_num = runtime['submit_num']
-                        task_key = (task_name, point, submit_num)
-                        summary = runtime.get('summary', {})
-                        #task._job_runner_name = summary.get('job_runner_name', 'N/A')
+                point = str(tokens['cycle'])
+                attempts = task_attempts.get((task_name, point), [])
+                runtime_ctx = _select_runtime_context(
+                    self.runtime_data, task_name, point
+                )
+                if not attempts and not runtime_ctx:
+                    continue
+
+                latest_task: Optional[Task] = None
+                for submit_num, task_info in attempts:
+                    task = Task(str(uuid4()), task_name)
+                    task._level = '1'
+                    task.set_id(f"{point}/{task_name}/{submit_num}")
+                    task._start_time = task_info[0] or 'N/A'
+                    task._end_time = task_info[3] or 'N/A'
+                    task._run_platform = task_info[4]
+                    task._status = task_info[2]
+                    if str(task_info[5]) == "1":
+                        task._manual_submit = "manually submitted"
+
+                    meta = runtime_ctx.get('meta', {})
+                    env = {}
+                    env.update(os.environ)
+                    env.update(runtime_ctx.get('environment', {}))
+                    env['CYLC_TASK_CYCLE_POINT'] = str(point)
+                    env['CYCLE_DATE'] = str(point).split('T')[0]
+
+                    for input_path in _parse_meta_list(meta.get('yprov_inputs')):
+                        input_path = _expand_vars(input_path, env)
+                        if input_path:
+                            for item in _make_data_items(input_path):
+                                task.add_input(item)
+                    for output_path in _parse_meta_list(meta.get('yprov_outputs')):
+                        output_path = _expand_vars(output_path, env)
+                        if output_path:
+                            for item in _make_data_items(output_path):
+                                task.add_output(item)
+
+                    data_out = _make_data(
+                        get_task_job_job_log(
+                            self.workflow, point, task_name, submit_num,
+                        )
+                    )
+                    task.add_output(data_out)
+                    data_out.set_producer(task._id)
+
+                    self.prov_workflow.add_task(task)
+                    latest_task = task
+
+                if latest_task is None and runtime_ctx:
+                    summary = runtime_ctx.get('summary', {})
+                    submit_num = _coerce_submit_num(runtime_ctx.get('submit_num'))
+                    if submit_num > 0:
+                        task = Task(str(uuid4()), task_name)
+                        task._level = '1'
+                        task.set_id(f"{point}/{task_name}/{submit_num}")
                         task._start_time = summary.get('started_time_string', 'N/A')
                         task._end_time = summary.get('finished_time_string', 'N/A')
-                        
-                        if task_key in task_infos:
-                            task_info = task_infos[task_key]
-                            # task._start_time = task_info[0]
-                            # task._end_time = task_info[3] if task_info[3] is not None else None
-                            task._run_platform = task_info[4]
-                            task._status = task_info[2]
-                            if task_info[5] == "1":
-                                task._manual_submit = "manually submitted"
-                        
-                        data_out = Data(str(uuid4()), get_task_job_job_log(self.workflow, runtime['point'], task_name, submit_num))
-                        task.add_output(data_out)
-                        data_out.set_producer(task._id)
-                        
-                        break
-                
-                self.prov_workflow.add_task(task)
-                task_map[node] = task                     
+                        self.prov_workflow.add_task(task)
+                        latest_task = task
+
+                if latest_task is not None:
+                    task_map[node] = latest_task
 
             for left, right in edges:
                 left_task = task_map.get(left)
                 right_task = task_map.get(right)
-                
-                if right and left:
-                    left_task.add_prev(right_task)
-                    right_task.add_next(left_task)
-            
+                if left_task is not None and right_task is not None:
+                    left_task.add_next(right_task)
+                    right_task.add_prev(left_task)
+
             self.prov_workflow._end_time = end
             self.prov_workflow._status = str(get_workflow_status(self))
-            
-            execution_wf = {
-                "id": self.prov_workflow._id,
-                "status": self.prov_workflow._status,
-                "endTime": self.prov_workflow._end_time,
-                "name": self.prov_workflow._name,
-                "startTime": self.prov_workflow._start_time,
-                "engineWMS": self.prov_workflow._engineWMS,
-                "resource_uri": self.prov_workflow._resource_cwl_uri,
-                "input": {i: i for i in self.prov_workflow._inputs},
-                "output": {o: o for o in self.prov_workflow._outputs},
-                "level": self.prov_workflow._level,
-            }
-            
             return self.prov_workflow
-        except Exception as e:
-            print(f"Error in populate_prov_workflow: {e}")
-            traceback.print_exc()
+
+        except Exception as exc:
+            LOG.exception("Error in populate_prov_workflow: %s", exc)
             return None
-    
-    # run scheduler + provenance tracking (yProv4WFs)
+
+    async def save_provenance_snapshot(
+        self,
+        final: bool = False,
+        force: bool = False,
+    ) -> Optional[str]:
+        """Write an incremental provenance snapshot for the current run."""
+        if not self._prov_workflow_start:
+            return None
+        if final and self._prov_final_snapshot_saved:
+            return None
+
+        now = time()
+        if (
+            not force
+            and not final
+            and now < (self._last_prov_snapshot_time + self.INTERVAL_PROV_SNAPSHOT)
+        ):
+            return None
+
+        wf_stop = datetime.now().isoformat()
+        prov_workflow = await self.populate_prov_workflow(
+            self._prov_workflow_start, wf_stop,
+        )
+        if prov_workflow is None:
+            return None
+
+        work_dir = get_workflow_run_dir(self.workflow)
+        json_path = prov_workflow.prov_to_json(work_dir)
+        if json_path:
+            self._last_prov_snapshot_time = now
+            if final:
+                self._prov_final_snapshot_saved = True
+                LOG.info("yProv4WFs wrote final provenance JSON: %s", json_path)
+            else:
+                LOG.info(
+                    "yProv4WFs wrote incremental provenance JSON: %s", json_path)
+        else:
+            LOG.error("yProv4WFs failed to write provenance JSON")
+        return json_path
+
     async def run_scheduler(self) -> None:
         """Start the scheduler main loop."""
         try:
@@ -819,9 +1053,6 @@ class Scheduler:
 
                     # If we shut down with manually triggered waiting tasks,
                     # submit them to run now.
-                    # NOTE: this will run tasks that were triggered with
-                    # the trigger "--on-resume" option, even if the workflow
-                    # is restarted as paused. Option to be removed at 8.5.0.
                     pre_prep_tasks = []
                     for itask in self.pool.get_tasks():
                         if (
@@ -834,7 +1065,6 @@ class Scheduler:
                     self.start_job_submission(pre_prep_tasks)
 
             self.run_event_handlers(self.EVENT_STARTUP, 'workflow starting')
-            
             await asyncio.gather(
                 *main_loop.get_runners(
                     self.main_loop_plugins,
@@ -847,9 +1077,11 @@ class Scheduler:
             # Non-async sleep - yield to other threads rather than event loop
             sleep(0)
             self.profiler.start()
-            wf_start = datetime.now().isoformat()
+            self._prov_workflow_start = datetime.now().isoformat()
+            await self.save_provenance_snapshot(force=True)
             while True:  # MAIN LOOP
                 await self._main_loop()
+
         except SchedulerStop as exc:
             # deliberate stop
             await self.shutdown(exc)
@@ -864,18 +1096,10 @@ class Scheduler:
                         self
                     )
                 )
-                # creation of provenance json file (yProv4WFs)
-                wf_stop = datetime.now().isoformat()
-                work_dir = get_workflow_run_dir(self.workflow)
                 try:
-                    self.prov_workflow = await self.populate_prov_workflow(wf_start, wf_stop)
-                    self.prov_workflow.prov_to_json(work_dir)
-                    print("if manually stopped prov is saved")
-                    #TODO understand how to save this info
-                except Exception as e:
-                    print(f"Error in to_prov: {e}")
-                    traceback.print_exc()
-                    return None
+                    await self.save_provenance_snapshot(final=True, force=True)
+                except Exception as exc:
+                    LOG.exception("Error in to_prov: %s", exc)
             except Exception as exc:
                 # Need to log traceback manually because otherwise this
                 # exception gets swallowed
@@ -904,19 +1128,12 @@ class Scheduler:
         else:
             # main loop ends (not used?)
             await self.shutdown(SchedulerStop(StopMode.AUTO.value))
+
         finally:
-            
-            # creation of provenance json file (yProv4WFs)
-            wf_stop = datetime.now().isoformat()
-            work_dir = get_workflow_run_dir(self.workflow)
             try:
-                self.prov_workflow = await self.populate_prov_workflow(wf_start, wf_stop)
-                self.prov_workflow.prov_to_json(work_dir)
-            except Exception as e:
-                print(f"Error in to_prov: {e}")
-                traceback.print_exc()
-                return None
-            
+                await self.save_provenance_snapshot(final=True, force=True)
+            except Exception as exc:
+                LOG.exception("Error in to_prov: %s", exc)
             self.profiler.stop()
 
     def load_workflow_params_and_tmpl_vars(self) -> List[Tuple[str, str]]:
@@ -959,6 +1176,7 @@ class Scheduler:
             else:
                 self.uuid_str = str(uuid4())
             self.task_events_mgr.uuid_str = self.uuid_str
+
             self._configure_contact()
             await self.configure(params)
         except (KeyboardInterrupt, asyncio.CancelledError, Exception) as exc:
@@ -998,12 +1216,15 @@ class Scheduler:
                 stop_mode = StopMode.REQUEST_NOW
 
             self._set_stop(stop_mode)
+            self._prov_snapshot_requested = True
+
     def _load_pool_from_tasks(self):
         """Load task pool with specified tasks, for a new run."""
         LOG.info(f"Start task: {self.options.starttask}")
+        start_tasks = command_validation.is_tasks(self.options.starttask)
         # flow number set in this call:
         self.pool.set_prereqs_and_outputs(
-            self.options.starttask,
+            start_tasks,
             outputs=[],
             prereqs=["all"],
             flow=[FLOW_NEW],
@@ -1045,6 +1266,14 @@ class Scheduler:
             self.xtrigger_mgr.load_xtrigger_for_restart)
         self.workflow_db_mgr.pri_dao.select_abs_outputs_for_restart(
             self.pool.load_abs_outputs_for_restart)
+
+        # Compute and release runahead tasks once after loading all tasks from
+        # the DB. This also causes spawning of parentless tasks out to the
+        # runahead limit, which may be necessary here if the stop point or
+        # runahead limit was changed for the restart.
+        self.pool.compute_runahead()
+        self.pool.release_runahead_tasks()
+
         self.pool.load_db_tasks_to_hold()
         self.pool.update_flow_mgr()
 
@@ -1074,9 +1303,7 @@ class Scheduler:
             if install_target == get_localhost_install_target():
                 continue
             # set off remote init
-            self.task_job_mgr.task_remote_mgr.remote_init(
-                platform, self.server.curve_auth,
-                self.server.client_pub_key_dir)
+            self.task_job_mgr.task_remote_mgr.remote_init(platform)
             # Remote init/file-install is done via process pool
             self.proc_pool.process()
             # add platform to map (to be picked up on main loop)
@@ -1106,7 +1333,7 @@ class Scheduler:
     def _load_task_run_times(self, row_idx, row):
         """Load run times of previously succeeded task jobs."""
         if row_idx == 0:
-            LOG.info("LOADING task run times")
+            LOG.debug("LOADING task run times")
         name, run_times_str = row
         try:
             taskdef = self.config.taskdefs[name]
@@ -1114,7 +1341,7 @@ class Scheduler:
             for run_time_str in run_times_str.rsplit(",", maxlen)[-maxlen:]:
                 run_time = int(run_time_str)
                 taskdef.elapsed_times.append(run_time)
-            LOG.info("+ %s: %s" % (
+            LOG.debug("+ %s: %s" % (
                 name, ",".join(str(s) for s in taskdef.elapsed_times)))
         except (KeyError, ValueError, AttributeError):
             return
@@ -1123,7 +1350,7 @@ class Scheduler:
         """Process incoming task messages for each task proxy.
 
         """
-        messages: 'Dict[str, List[Tuple[Optional[int], TaskMsg]]]' = {}
+        messages: dict[str, list[TaskMsg]] = {}
 
         # Retrieve queued messages
         while self.message_queue.qsize():
@@ -1132,44 +1359,45 @@ class Scheduler:
             except Empty:
                 break
             self.message_queue.task_done()
-            tokens = Tokens(task_msg.job_id, relative=True)
             # task ID (job stripped)
-            task_id = tokens.duplicate(job=None).relative_id
-            messages.setdefault(task_id, [])
-            # job may be None (e.g. simulation mode)
-            job = int(tokens['job']) if tokens['job'] else None
-            messages[task_id].append(
-                (job, task_msg)
-            )
+            task_id = task_msg.job_id.duplicate(job=None).relative_id
+            messages.setdefault(task_id, []).append(task_msg)
 
+        unprocessed_messages: List[TaskMsg] = []
         # Poll tasks for which messages caused a backward state change.
-        to_poll_tasks = []
-        for itask in self.pool.get_tasks():
-            message_items = messages.get(itask.identity)
-            if message_items is None:
+        to_poll_tasks: List[TaskProxy] = []
+        for task_id, message_items in messages.items():
+            itask = self.pool._get_task_by_id(task_id)
+            if itask is None:
+                unprocessed_messages.extend(message_items)
                 continue
             should_poll = False
-            del messages[itask.identity]
-            for submit_num, tm in message_items:
+            for tm in message_items:
                 if self.task_events_mgr.process_message(
                     itask, tm.severity, tm.message, tm.event_time,
-                    self.task_events_mgr.FLAG_RECEIVED, submit_num
+                    self.task_events_mgr.FLAG_RECEIVED, tm.job_id.submit_num
                 ):
                     should_poll = True
             if should_poll:
                 to_poll_tasks.append(itask)
         if to_poll_tasks:
-            self.task_job_mgr.poll_task_jobs(self.workflow, to_poll_tasks)
-            # version 8.5.x
-            # self.task_job_mgr.poll_task_jobs(to_poll_tasks)
+            self.task_job_mgr.poll_task_jobs(to_poll_tasks)
+
         # Remaining unprocessed messages have no corresponding task proxy.
         # For example, if I manually set a running task to succeeded, the
         # proxy can be removed, but the orphaned job still sends messages.
-        for tms in messages.values():
-            warn = "Undeliverable task messages received and ignored:"
-            for _, msg in tms:
-                warn += f'\n  {msg.job_id}: {msg.severity} - "{msg.message}"'
-            LOG.warning(warn)
+        warn = ""
+        for tm in unprocessed_messages:
+            job_tokens = self.tokens.duplicate(tm.job_id)
+            tdef = self.config.get_taskdef(job_tokens['task'])
+            if not self.task_events_mgr.process_job_message(
+                job_tokens, tdef, tm.message, tm.event_time
+            ):
+                warn += f'\n  {tm.job_id}: {tm.severity} - "{tm.message}"'
+        if warn:
+            LOG.warning(
+                f"Undeliverable task messages received and ignored:{warn}"
+            )
 
     async def process_command_queue(self) -> None:
         """Process queued commands."""
@@ -1213,15 +1441,6 @@ class Scheduler:
 
             self.command_queue.task_done()
 
-    def info_get_graph_raw(self, cto, ctn, grouping=None):
-        """Return raw graph."""
-        return (
-            self.config.get_graph_raw(cto, ctn, grouping),
-            self.config.workflow_polling_tasks,
-            self.config.leaves,
-            self.config.feet
-        )
-
     def _set_stop(self, stop_mode: Optional[StopMode] = None) -> None:
         """Set shutdown mode."""
         self.proc_pool.set_stopping()
@@ -1243,9 +1462,13 @@ class Scheduler:
         to_kill: List[TaskProxy] = []
         unkillable: List[TaskProxy] = []
         for itask in itasks:
-            if itask.state(*TASK_STATUSES_ACTIVE):
-                if itask.state_reset(is_held=True):
-                    self.data_store_mgr.delta_task_state(itask)
+            if not itask.state(TASK_STATUS_PREPARING, *TASK_STATUSES_ACTIVE):
+                unkillable.append(itask)
+                continue
+            self.pool.hold_active_task(itask)
+            if itask.state(TASK_STATUS_PREPARING):
+                self.task_job_mgr.kill_prep_task(itask)
+            else:
                 to_kill.append(itask)
                 if jobless:
                     # Directly set failed in sim mode:
@@ -1253,150 +1476,16 @@ class Scheduler:
                         itask, 'CRITICAL', TASK_STATUS_FAILED,
                         flag=self.task_events_mgr.FLAG_RECEIVED
                     )
-            else:
-                unkillable.append(itask)
         if warn and unkillable:
             LOG.warning(
                 "Tasks not killable: "
                 f"{', '.join(sorted(t.identity for t in unkillable))}"
             )
         if not jobless:
-            self.task_job_mgr.kill_task_jobs(self.workflow, to_kill)
-            # version 8.5.x
-            # self.task_job_mgr.kill_task_jobs(to_kill)
+            self.task_job_mgr.kill_task_jobs(to_kill)
+
         return len(unkillable)
 
-    def remove_tasks(
-        self, items: Iterable[str], flow_nums: Optional['FlowNums'] = None
-    ) -> None:
-        """Remove tasks (`cylc remove` command).
-
-        Args:
-            items: Relative IDs or globs.
-            flow_nums: Flows to remove the tasks from. If empty or None, it
-                means 'all'.
-        """
-        active, inactive, _unmatched = self.pool.filter_task_proxies(
-            items, warn_no_active=False, inactive=True
-        )
-        if not (active or inactive):
-            return
-
-        if flow_nums is None:
-            flow_nums = set()
-        # Mapping of *relative* task IDs to removed flow numbers:
-        removed: Dict[Tokens, FlowNums] = {}
-        not_removed: Set[Tokens] = set()
-        # All the matched tasks (will add applicable active tasks below):
-        matched_tasks = inactive.copy()
-        to_kill: List[TaskProxy] = []
-
-        for itask in active:
-            fnums_to_remove = itask.match_flows(flow_nums)
-            if not fnums_to_remove:
-                not_removed.add(itask.tokens.task)
-                continue
-            removed[itask.tokens.task] = fnums_to_remove
-            matched_tasks.add((itask.tdef, itask.point))
-            if fnums_to_remove == itask.flow_nums:
-                # Need to remove the task from the pool.
-                # Spawn next occurrence of xtrigger sequential task (otherwise
-                # this would not happen after removing this occurrence):
-                self.pool.check_spawn_psx_task(itask)
-                self.pool.remove(itask, 'request')
-                to_kill.append(itask)
-                itask.removed = True
-            itask.flow_nums.difference_update(fnums_to_remove)
-
-        for tdef, point in matched_tasks:
-            tokens = Tokens(cycle=str(point), task=tdef.name)
-
-            # Go through any tasks downstream of this matched task to see if
-            # any need to stand down as a result of this task being removed:
-            for child in set(itertools.chain.from_iterable(
-                generate_graph_children(tdef, point).values()
-            )):
-                child_itask = self.pool.get_task(child.point, child.name)
-                if not child_itask:
-                    continue
-                fnums_to_remove = child_itask.match_flows(flow_nums)
-                if not fnums_to_remove:
-                    continue
-                prereqs_changed = False
-                for prereq in (
-                    *child_itask.state.prerequisites,
-                    *child_itask.state.suicide_prerequisites,
-                ):
-                    # Unset any prereqs naturally satisfied by these tasks
-                    # (do not unset those satisfied by `cylc set --pre`):
-                    if prereq.unset_naturally_satisfied(tokens.relative_id):
-                        prereqs_changed = True
-                        removed.setdefault(tokens, set()).update(
-                            fnums_to_remove
-                        )
-                if not prereqs_changed:
-                    continue
-                self.data_store_mgr.delta_task_prerequisite(child_itask)
-                # Check if downstream task is still ready to run:
-                if (
-                    child_itask.state.is_gte(TASK_STATUS_PREPARING)
-                    # Still ready if the task exists in other flows:
-                    or child_itask.flow_nums != fnums_to_remove
-                    or child_itask.state.prerequisites_all_satisfied()
-                ):
-                    continue
-                # No longer ready to run
-                self.pool.unqueue_task(child_itask)
-                # Check if downstream task should remain spawned:
-                if (
-                    # Ignoring tasks we are already dealing with:
-                    (child_itask.tdef, child_itask.point) in matched_tasks
-                    or child_itask.state.any_satisfied_prerequisite_outputs()
-                ):
-                    continue
-                # No longer has reason to be in pool:
-                self.pool.remove(child_itask, self.pool.REMOVED_BY_PREREQ)
-                # Remove this downstream task from flows in DB tables to ensure
-                # it is not skipped if it respawns in future:
-                self.workflow_db_mgr.remove_task_from_flows(
-                    str(child.point), child.name, fnums_to_remove
-                )
-
-            # Remove the matched tasks from the flows in the DB tables:
-            db_removed_fnums = self.workflow_db_mgr.remove_task_from_flows(
-                str(point), tdef.name, flow_nums,
-            )
-            if db_removed_fnums:
-                removed.setdefault(tokens, set()).update(db_removed_fnums)
-
-            if tokens not in removed:
-                not_removed.add(tokens)
-
-        if to_kill:
-            self.kill_tasks(to_kill, warn=False)
-
-        if removed:
-            tasks_str_list = []
-            for task, fnums in removed.items():
-                self.data_store_mgr.delta_remove_task_flow_nums(
-                    task.relative_id, fnums
-                )
-                tasks_str_list.append(
-                    f"{task.relative_id} {repr_flow_nums(fnums, full=True)}"
-                )
-            LOG.info(f"Removed task(s): {', '.join(sorted(tasks_str_list))}")
-
-        if not_removed:
-            fnums_str = (
-                repr_flow_nums(flow_nums, full=True) if flow_nums else ''
-            )
-            tasks_str = ', '.join(
-                sorted(tokens.relative_id for tokens in not_removed)
-            )
-            LOG.warning(f"Task(s) not removable: {tasks_str} {fnums_str}")
-
-        if removed and self.pool.compute_runahead():
-            self.pool.release_runahead_tasks()
     def get_restart_num(self) -> int:
         """Return the number of the restart, else 0 if not a restart.
 
@@ -1415,6 +1504,7 @@ class Scheduler:
         """
         fields = workflow_files.ContactFileFields
         proc = psutil.Process()
+        platform = get_platform()
         # fmt: off
         return {
             fields.API:
@@ -1440,11 +1530,11 @@ class Scheduler:
             fields.VERSION:
                 CYLC_VERSION,
             fields.SCHEDULER_SSH_COMMAND:
-                str(get_platform()['ssh command']),
+                str(platform['ssh command']),
             fields.SCHEDULER_CYLC_PATH:
-                str(get_platform()['cylc path']),
+                str(platform['cylc path']),
             fields.SCHEDULER_USE_LOGIN_SHELL:
-                str(get_platform()['use login shell'])
+                str(platform['use login shell'])
         }
         # fmt: on
 
@@ -1452,7 +1542,7 @@ class Scheduler:
         """Create contact file."""
         # Make sure another workflow of the same name hasn't started while this
         # one is starting
-        # NOTE: raises ContactFileExists if workflow is running
+        # NOTE: raises SchedulerAlive if workflow is running
         workflow_files.detect_old_contact_file(self.workflow)
 
         # Extract contact data.
@@ -1526,7 +1616,7 @@ class Scheduler:
         })
 
     def _set_workflow_params(
-        self, params: Iterable[Tuple[str, Optional[str]]]
+        self, params: Iterable[tuple[str, str | None]]
     ) -> None:
         """Set workflow params on restart/reload.
 
@@ -1538,20 +1628,20 @@ class Scheduler:
         * A flag to indicate if the workflow should be paused or not.
         * Original workflow run time zone.
         """
-        LOG.info('LOADING workflow parameters')
+        LOG.info("LOADING saved workflow parameters")
         for key, value in params:
             if key == self.workflow_db_mgr.KEY_RUN_MODE:
                 self.options.run_mode = value or RunMode.LIVE.value
                 LOG.info(f"+ run mode = {value}")
             if value is None:
                 continue
-            if key in self.workflow_db_mgr.KEY_INITIAL_CYCLE_POINT_COMPATS:
+            if key == self.workflow_db_mgr.KEY_INITIAL_CYCLE_POINT:
                 self.options.icp = value
                 LOG.info(f"+ initial point = {value}")
-            elif key in self.workflow_db_mgr.KEY_START_CYCLE_POINT_COMPATS:
+            elif key == self.workflow_db_mgr.KEY_START_CYCLE_POINT:
                 self.options.startcp = value
                 LOG.info(f"+ start point = {value}")
-            elif key in self.workflow_db_mgr.KEY_FINAL_CYCLE_POINT_COMPATS:
+            elif key == self.workflow_db_mgr.KEY_FINAL_CYCLE_POINT:
                 if self.is_restart and self.options.fcp == 'reload':
                     LOG.debug(f"- final point = {value} (ignored)")
                 elif self.options.fcp is None:
@@ -1639,43 +1729,38 @@ class Scheduler:
         """
         pre_prep_tasks: Set['TaskProxy'] = set()
         if (
-            self.stop_mode is None
+            not self.stop_mode
             and self.auto_restart_time is None
             and self.reload_pending is False
         ):
             if self.pool.tasks_to_trigger_now:
-                # manually triggered tasks to run now, workflow paused or not
+                # manually triggered tasks to run now.
                 pre_prep_tasks.update(self.pool.tasks_to_trigger_now)
                 self.pool.tasks_to_trigger_now = set()
 
             if not self.is_paused:
                 # release queued tasks
                 pre_prep_tasks.update(self.pool.release_queued_tasks())
-                if self.pool.tasks_to_trigger_on_resume:
-                    # and manually triggered tasks to run once workflow resumed
-                    pre_prep_tasks.update(self.pool.tasks_to_trigger_on_resume)
-                    self.pool.tasks_to_trigger_on_resume = set()
 
-        elif (
-            (
-                # Need to get preparing tasks to submit before auto restart
-                self.should_auto_restart_now()
-                and self.auto_restart_mode == AutoRestartMode.RESTART_NORMAL
-            ) or (
-                # Need to get preparing tasks to submit before reload
-                self.reload_pending
-            )
+        if (
+            # Manually triggered tasks will be preparing and should
+            # be submitted even if paused (unless workflow is stopping).
+            self.is_paused and not self.stop_mode
+        ) or (
+            # Need to get preparing tasks to submit before auto restart
+            self.should_auto_restart_now()
+            and self.auto_restart_mode == AutoRestartMode.RESTART_NORMAL
+        ) or (
+            # Need to get preparing tasks to submit before reload
+            self.reload_pending
         ):
-            # finish processing preparing tasks first
-            pre_prep_tasks = {
-                itask for itask in self.pool.get_tasks()
-                if itask.state(TASK_STATUS_PREPARING)
-            }
+            pre_prep_tasks.update({
+                itask
+                for itask in self.pool.get_tasks()
+                if itask.waiting_on_job_prep
+            })
 
         # Return, if no tasks to submit.
-        else:
-            return False
-
         if not pre_prep_tasks:
             return False
 
@@ -1689,33 +1774,41 @@ class Scheduler:
         """
         if self.stop_mode is not None:
             return False
+
         self.is_updated = True
         self.reset_inactivity_timer()
 
         self.task_job_mgr.task_remote_mgr.rsync_includes = (
             self.config.get_validated_rsync_includes())
 
-        log = LOG.debug
+        submitted = self.submit_task_jobs(itasks)
+        if not submitted:
+            return False
+
+        log_lvl = logging.DEBUG
         if self.options.reftest or self.options.genref:
-            log = LOG.info
-        for itask in self.task_job_mgr.submit_task_jobs(
-            self.workflow, #delete in v-8.5.x
-            itasks,
-            self.server.curve_auth,
-            self.server.client_pub_key_dir,
-            run_mode=self.get_run_mode()
-        ):
-            if itask.flow_nums:
-                flow = ','.join(str(i) for i in itask.flow_nums)
+            log_lvl = logging.INFO
+
+        for itask in submitted:
+            flow = stringify_flow_nums(itask.flow_nums) or FLOW_NONE
+            if itask.is_manual_submit:
+                off = f"[] in flow {flow}"
             else:
-                flow = FLOW_NONE
-            log(
-                f"{itask.identity} -triggered off "
-                f"{itask.state.get_resolved_dependencies()} in flow {flow}"
-            )
+                off = (
+                    f"{itask.state.get_resolved_dependencies()}"
+                    f" in flow {flow}"
+                )
+            LOG.log(log_lvl, f"{itask.identity} -triggered off {off}")
 
         # one or more tasks were passed through the submission pipeline
         return True
+
+    def submit_task_jobs(
+        self, itasks: 'Iterable[TaskProxy]'
+    ) -> 'List[TaskProxy]':
+        """Submit task jobs, return tasks that attempted submission."""
+        # Note: keep this as simple wrapper for task job mgr's method
+        return self.task_job_mgr.submit_task_jobs(itasks, self.get_run_mode())
 
     def process_workflow_db_queue(self):
         """Update workflow DB."""
@@ -1755,9 +1848,8 @@ class Scheduler:
         self.check_workflow_timers()
         # check submission and execution timeout and polling timers
         if self.get_run_mode() != RunMode.SIMULATION:
-            self.task_job_mgr.check_task_jobs(self.workflow, self.pool)
-            # version 8.5.x
-            # self.task_job_mgr.check_task_jobs(self.pool)
+            self.task_job_mgr.check_task_jobs(self.pool)
+
     async def workflow_shutdown(self):
         """Determines if the workflow can be shutdown yet."""
         if self.pool.check_abort_on_task_fails():
@@ -1800,8 +1892,8 @@ class Scheduler:
             self.time_next_kill is not None
             and time() > self.time_next_kill
         ):
-            await commands.run_cmd(commands.poll_tasks(self, ['*/*']))
-            await commands.run_cmd(commands.kill_tasks(self, ['*/*']))
+            self.task_job_mgr.poll_task_jobs(self.pool.get_tasks())
+            self.kill_tasks(self.pool.get_tasks(), warn=False)
             self.time_next_kill = time() + self.INTERVAL_STOP_KILL
 
         # Is the workflow set to auto stop [+restart] now ...
@@ -1809,6 +1901,7 @@ class Scheduler:
             # ... no
             pass
         elif self.auto_restart_mode == AutoRestartMode.RESTART_NORMAL:
+
             # ... yes - wait for preparing jobs to see if they're local and
             # wait for local jobs to complete before restarting
             #    * Avoid polling issues - see #2843
@@ -1832,7 +1925,13 @@ class Scheduler:
                              'complete before attempting restart')
                     break
             else:  # no break
-                self._set_stop(StopMode.REQUEST_NOW_NOW)
+                if self.pool.pre_start_tasks_to_trigger:
+                    LOG.info(
+                        'Waiting for pre start-cycle tasks to complete before'
+                        ' attempting restart'
+                    )
+                else:
+                    self._set_stop(StopMode.REQUEST_NOW_NOW)
         elif (  # noqa: SIM106
             self.auto_restart_mode == AutoRestartMode.FORCE_STOP
         ):
@@ -1863,7 +1962,7 @@ class Scheduler:
             proc = None
             try:
                 new_host = select_workflow_host(cached=False)[0]
-            except (gaierror, HostSelectException) as exc:
+            except HostSelectException as exc:
                 error = str(exc)
             else:
                 LOG.info(f'Attempting to restart on "{new_host}"')
@@ -1910,7 +2009,7 @@ class Scheduler:
     async def _main_loop(self) -> None:
         """A single iteration of the main loop."""
         tinit = time()
-        
+
         # Useful for debugging core scheduler issues:
         # import logging
         # self.pool.log_task_pool(logging.CRITICAL)
@@ -1945,29 +2044,26 @@ class Scheduler:
 
             if itask.is_ready_to_run() and not itask.is_manual_submit:
                 self.pool.queue_task(itask)
-     
-        if self.xtrigger_mgr.sequential_spawn_next:
-            self.pool.spawn_parentless_sequential_xtriggers()
 
         if self.xtrigger_mgr.do_housekeeping:
             self.xtrigger_mgr.housekeep(self.pool.get_tasks())
-
         self.pool.clock_expire_tasks()
         self.release_tasks_to_run()
-        
-        # save information in runtime_data dictionary for provenance tracking (yProv4WFs)
+
+        # collect runtime data for provenance (yProv4WFs)
         for itask in self.pool.get_tasks():
             name = itask.identity
             if name not in self.runtime_data:
-                # If not, initialize it as a new dictionary
                 self.runtime_data[name] = {}
             self.runtime_data[name]['identity'] = name
             self.runtime_data[name]['summary'] = itask.summary
             self.runtime_data[name]['name'] = itask.tdef.name
             self.runtime_data[name]['point'] = itask.point
             self.runtime_data[name]['submit_num'] = itask.submit_num
-            #self.runtime_data[name]['start'] = datetime.now().isoformat()
-            
+            self.runtime_data[name]['meta'] = itask.tdef.rtconfig.get('meta', {})
+            self.runtime_data[name]['environment'] = (
+                itask.tdef.rtconfig.get('environment', {}))
+
         if (
             self.get_run_mode() == RunMode.SIMULATION
             and sim_time_check(
@@ -1979,13 +2075,29 @@ class Scheduler:
             # A simulated task state change occurred.
             self.reset_inactivity_timer()
 
-        self.broadcast_mgr.expire_broadcast(self.pool.get_min_point())
+        # auto expire broadcasts
+        if not self.is_paused:
+            # NOTE: Don't auto-expire broadcasts whilst the scheduler is
+            # paused. This allows broadcast-and-trigger beyond the expiry
+            # limit, by pausing before doing it (after which the expiry
+            # limit moves back).
+            with suppress(TimePointDumperBoundsError):
+                # NOTE: TimePointDumperBoundsError will be raised for negative
+                # cycle points, we skip broadcast expiry in this circumstance
+                # (pre-initial condition)
+                if min_point := self.pool.get_min_point():
+                    # NOTE: the broadcast expire limit is the oldest active
+                    # cycle MINUS the longest cycling interval
+                    self.broadcast_mgr.expire_broadcast(
+                        min_point - self.config.interval_of_longest_sequence
+                    )
+
         self.late_tasks_check()
 
         self.process_queued_task_messages()
         await self.process_command_queue()
         self.task_events_mgr.process_events(self)
-       
+
         # Update state summary, database, and uifeed
         self.workflow_db_mgr.put_task_event_timers(self.task_events_mgr)
 
@@ -2007,7 +2119,9 @@ class Scheduler:
         if has_updated:
             if not self.is_reloaded:
                 # (A reload cannot un-stall workflow by itself)
-                self.is_stalled = False
+                if self.is_stalled:
+                    self.is_stalled = False
+                    self.update_data_store()
             self.is_reloaded = False
 
             # Reset workflow and task updated flags.
@@ -2023,11 +2137,19 @@ class Scheduler:
         self.process_workflow_db_queue()
 
         # If public database is stuck, blast it away by copying the content
-        # of the private database into it.
+        # of the private database into it before provenance reads from it.
         self.database_health_check()
+
+        # save incremental provenance snapshot (yProv4WFs)
+        if has_updated or self._prov_snapshot_requested:
+            await self.save_provenance_snapshot(
+                force=self._prov_snapshot_requested,
+            )
+            self._prov_snapshot_requested = False
+
         # Shutdown workflow if timeouts have occurred
         self.timeout_check()
-       
+
         # Does the workflow need to shutdown on task failure?
         await self.workflow_shutdown()
 
@@ -2046,7 +2168,7 @@ class Scheduler:
         if not has_updated and not self.stop_mode:
             # Has the workflow stalled?
             self.check_workflow_stalled()
-        
+
         # Sleep a bit for things to catch up.
         # Quick sleep if there are items pending in process pool.
         # (Should probably use quick sleep logic for other queues?)
@@ -2118,11 +2240,9 @@ class Scheduler:
             return True
         if self.is_paused:  # cannot be stalled it's not even running
             return False
-        is_stalled = self.pool.is_stalled()
-        if is_stalled != self.is_stalled:
+        if self.pool.is_stalled():
+            self.is_stalled = True
             self.update_data_store()
-            self.is_stalled = is_stalled
-        if self.is_stalled:
             LOG.critical("Workflow stalled")
             self.run_event_handlers(self.EVENT_STALL, 'workflow stalled')
             with suppress(KeyError):
@@ -2135,6 +2255,7 @@ class Scheduler:
         # At the moment this method must be called from the main_loop.
         # In the future it should shutdown the main_loop itself but
         # we're not quite there yet.
+
         # cancel signal handlers
         def _handle_signal(sig, frame):
             LOG.warning(
@@ -2343,7 +2464,6 @@ class Scheduler:
         self.is_paused = True
         self.workflow_db_mgr.put_workflow_paused(True)
         self.update_data_store()
-        # TODO produce yprov document??
 
     def resume_workflow(self, quiet: bool = False) -> None:
         """Resume the workflow.
@@ -2359,7 +2479,7 @@ class Scheduler:
             return
         if not self.is_paused:
             if not quiet:
-                LOG.warning("No need to resume - workflow is not paused")
+                LOG.info("No need to resume - workflow is not paused")
             return
         if not quiet:
             LOG.info("RESUMING the workflow now")
