@@ -147,10 +147,9 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         # Streamflow database and the 'relative' targets inside CWL files.
         full_path_map = {}
         for full_path in self.tasks_by_step_name.keys():
-            # This mapping assumes unique short names per layer.
-            # Safe by design: CWL specifications strictly enforce unique step identifiers per scope.
-            short_name = full_path.lstrip('/').split('/')[-1]
-            full_path_map[short_name] = full_path
+            normalized_path = '/' + full_path.lstrip('/')
+            short_name = normalized_path.split('/')[-1]
+            full_path_map[short_name] = normalized_path
         logger.info(f"Full path map: {full_path_map}")
 
         for filename in cwl_files:
