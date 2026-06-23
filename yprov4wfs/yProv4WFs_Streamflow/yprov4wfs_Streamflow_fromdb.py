@@ -1,9 +1,7 @@
 """
-This version includes the fix for generating a 
-connected graph even in the presence of nested sub-workflows.
-
-Moreover, the version excludes from the generated JSON provenance file
-the 'level 0' node.
+This version includes:
+- Path normalization for handling multi-tier nested workflows.
+- Complete removal of the Level 0 activity node and its peripheral entities.
 """
 
 import os
@@ -111,7 +109,8 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         self.map_file: MutableMapping[str, str] = {}
         self.prov_workflow = None
         self.tasks_by_step_name = {}
-        logger.info("Starting new yprov4wfs version")
+        self.computed_cwl_deps = {}  # Store resolved structural dependencies
+        logger.info("YPROV: Starting and loading workflows...")
         
     @abstractmethod
     async def get_main_entity(self) -> MutableMapping[str, Any]: ...
@@ -143,8 +142,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         logger.info(f"YPROV: Discovered CWL files for parsing: {cwl_files}")
 
         # Map out all short names to their absolute execution paths.
-        # This builds a bridge between the 'absolute' paths stored in the
-        # Streamflow database and the 'relative' targets inside CWL files.
         full_path_map = {}
         for full_path in self.tasks_by_step_name.keys():
             normalized_path = '/' + full_path.lstrip('/')
@@ -166,21 +163,15 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
 
                 # Evaluate each step found inside the targeted workflow structure
                 for step_id, step_val in steps_items:
-                    # step_id represents the name of the execution step
                     short_step_name = step_id.split('/')[-1]
-                    
-                    # Retrieve the absolute database execution path from the mapping
                     full_step_name = full_path_map.get(short_step_name)
 
                     if not full_step_name:
-                        logger.debug(f"YPROV: Step {short_step_name} not found in execution map, skipping.")
                         continue
                     
                     if full_step_name not in dependencies:
                         dependencies[full_step_name] = []
                     
-                    # Derive the unique prefix specifically for this step's neighborhood
-                    # Example: "/nested_b/nested_d/step_d1" -> "/nested_b/nested_d"
                     current_prefix = full_step_name.rsplit('/', 1)[0]
                     
                     inputs = step_val.get('in', [])
@@ -192,27 +183,18 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                             sources = src if isinstance(src, list) else [src]
                             for s in sources:
                                 # CASE 1: Standard dependency declared within the same file scope
-                                # The parent source name is explicitly written containing a forward slash separator
                                 if '/' in s:
                                     parent_short_name = s.split('/')[0]
                                     full_parent_name = f"{current_prefix}/{parent_short_name}" if current_prefix else f"/{parent_short_name}"
                                     if full_parent_name in full_path_map.values() and full_parent_name not in dependencies[full_step_name]:
                                         dependencies[full_step_name].append(full_parent_name)
                                 
-                                # CASE 2: Nested input boundary fallback (e.g., source data with no slash)
-                                # The dependency is fed down directly from a sub-workflow's outer boundary 
-                                # or global configuration rather than an internal task node.
+                                # CASE 2: Nested input boundary fallback
                                 elif current_prefix and current_prefix != '/':
-                                    # Verify structural step depth to execute fallback only on deeply nested tasks (>=2 slashes)
-                                    # This blocks top-level parallel roots from misinterpreting shared inputs as cross-talk
-                                    # Example: "/nested_b" has 1 slash (Depth 2 task) -> skip fallback
-                                    # Example: "/nested_b/nested_d" has 2 slashes (Depth 3 task) -> process fallback
                                     if current_prefix.count('/') >= 2:
                                         parent_environment = current_prefix.rsplit('/', 1)[0]
                                         
                                         for short_name, full_path in full_path_map.items():
-                                            # Enforce that the parent candidate resides strictly in the parent boundary,
-                                            # is not nested deeper inside the current target context, and is not itself.
                                             if (full_path.startswith(parent_environment) and 
                                                 not full_path.startswith(current_prefix) and 
                                                 full_path != full_step_name):
@@ -224,7 +206,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                 logger.warning(f"YPROV: Error parsing file {filename}: {e}")
                 continue
 
-        logger.info(f"Dependencies list: {dependencies}")
+        logger.info(f"YPROV Dependencies list: {dependencies}")
         return dependencies
 
     async def populate_prov_workflow(self):
@@ -243,8 +225,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
             if "config" in self.map_file:
                 self.prov_workflow._resource_cwl_uri = self.map_file["config"]
             
-            # Extract both input and output ports of the given workflow id
-            # by using a combination of database retrieval queries
             all_steps = await self.context.database.get_workflow_steps(wf.persistent_id)
             
             for step in all_steps:
@@ -299,11 +279,11 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                             task.add_output(data_out)
                             data_out.set_producer(task._id)
 
-            cwl_deps = self._parse_cwl_for_dependencies()
+            self.computed_cwl_deps = self._parse_cwl_for_dependencies()
 
-            for child_name, parents in cwl_deps.items():
+            # Linking structural dependencies inside the data model
+            for child_name, parents in self.computed_cwl_deps.items():
                 child_tasks = self.tasks_by_step_name.get(child_name)
-                
                 if not child_tasks:
                     child_tasks = self.tasks_by_step_name.get(f"/{child_name}")
 
@@ -340,8 +320,68 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         os.makedirs(outdir, exist_ok=True)
         path = os.path.join(outdir, filename or (self.workflows[0].name + ".zip"))
         
-        # Generate the initial JSON file using the native method
+        # Generate the initial JSON file
         json_file_path = self.prov_workflow.prov_to_json()  
+        
+        # ----------------------------------------------------------------------
+        # POST-SERIALIZATION GRAPH SYNCHRONIZATION
+        # ----------------------------------------------------------------------
+        try:
+            with open(json_file_path, 'r') as f:
+                prov_data = json.load(f)
+            
+            if "wasInformedBy" not in prov_data:
+                prov_data["wasInformedBy"] = {}
+
+            # Audit established relations
+            existing_relations = set()
+            if isinstance(prov_data.get("wasInformedBy"), dict):
+                for rel in prov_data["wasInformedBy"].values():
+                    if isinstance(rel, dict) and "prov:informed" in rel and "prov:informant" in rel:
+                        existing_relations.add((rel["prov:informed"], rel["prov:informant"]))
+
+            injected_counter = 0
+
+            # Step across explicit dependencies discovered from the CWL structure
+            for child_path, parent_paths in self.computed_cwl_deps.items():
+                # Cross-reference execution arrays using comprehensive symmetric fallbacks
+                child_tasks = (self.tasks_by_step_name.get(child_path) or 
+                               self.tasks_by_step_name.get(child_path.lstrip('/')) or 
+                               self.tasks_by_step_name.get(f"/{child_path.lstrip('/')}"))
+                if not child_tasks:
+                    continue
+
+                for parent_path in parent_paths:
+                    parent_tasks = (self.tasks_by_step_name.get(parent_path) or 
+                                    self.tasks_by_step_name.get(parent_path.lstrip('/')) or 
+                                    self.tasks_by_step_name.get(f"/{parent_path.lstrip('/')}"))
+                    if not parent_tasks:
+                        continue
+
+                    # Guarantee all active parent elements match their corresponding child definitions
+                    for p_task in parent_tasks:
+                        for c_task in child_tasks:
+                            p_uuid = p_task._id
+                            c_uuid = c_task._id
+
+                            # Prevent circular self-references and block pre-existing definitions
+                            if p_uuid != c_uuid and (c_uuid, p_uuid) not in existing_relations:
+                                relation_key = f"_:informed_{uuid.uuid4().hex[:8]}"
+                                prov_data["wasInformedBy"][relation_key] = {
+                                    "prov:informed": c_uuid,
+                                    "prov:informant": p_uuid
+                                }
+                                existing_relations.add((c_uuid, p_uuid))
+                                injected_counter += 1
+
+            logger.info(f"YPROV: Synchronized {injected_counter} 'wasInformedBy' edges during validation layout step.")
+            
+            with open(json_file_path, 'w') as f:
+                json.dump(prov_data, f, indent=4)
+
+        except Exception as e:
+            logger.error(f"YPROV: Internal synchronization error occurred while creating archive: {e}")
+        # ----------------------------------------------------------------------
         
         # ----------------------------------------------------------------------
         # PURGE LEVEL 0 ACTIVITY + ASSOCIATED ENTITIES
@@ -356,36 +396,38 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                 entities_to_purge = set()
 
                 # Scan relationships to identify all entity IDs linked to level 0
-                if "used" in prov_data:
+                if "used" in prov_data and isinstance(prov_data["used"], dict):
                     for rel in prov_data["used"].values():
-                        if rel.get("prov:activity") == level_0_id and "prov:entity" in rel:
+                        if isinstance(rel, dict) and rel.get("prov:activity") == level_0_id and "prov:entity" in rel:
                             entities_to_purge.add(rel["prov:entity"])
                             
-                if "wasGeneratedBy" in prov_data:
+                if "wasGeneratedBy" in prov_data and isinstance(prov_data["wasGeneratedBy"], dict):
                     for rel in prov_data["wasGeneratedBy"].values():
-                        if rel.get("prov:activity") == level_0_id and "prov:entity" in rel:
+                        if isinstance(rel, dict) and rel.get("prov:activity") == level_0_id and "prov:entity" in rel:
                             entities_to_purge.add(rel["prov:entity"])
 
                 # Delete the identified entities from the 'entity' block
-                if "entity" in prov_data:
+                if "entity" in prov_data and isinstance(prov_data["entity"], dict):
                     for ent_id in entities_to_purge:
                         if ent_id in prov_data["entity"]:
                             del prov_data["entity"][ent_id]
                     logger.info(f"YPROV: Purged {len(entities_to_purge)} level 0 entities.")
 
                 # Delete the level 0 activity itself
-                if "activity" in prov_data and level_0_id in prov_data["activity"]:
+                if "activity" in prov_data and isinstance(prov_data["activity"], dict) and level_0_id in prov_data["activity"]:
                     del prov_data["activity"][level_0_id]
                     logger.info(f"YPROV: Purged level 0 activity '{level_0_id}'.")
 
                 # Clean up all relationship edges involving the level 0 node
                 for rel_type in ["wasInformedBy", "used", "wasGeneratedBy", "wasAssociatedWith"]:
-                    if rel_type in prov_data:
+                    if rel_type in prov_data and isinstance(prov_data[rel_type], dict):
                         keys_to_delete = [
                             k for k, v in prov_data[rel_type].items() 
-                            if v.get("prov:activity") == level_0_id or 
-                            v.get("prov:informant") == level_0_id or 
-                            v.get("prov:informed") == level_0_id
+                            if isinstance(v, dict) and (
+                                v.get("prov:activity") == level_0_id or 
+                                v.get("prov:informant") == level_0_id or 
+                                v.get("prov:informed") == level_0_id
+                            )
                         ]
                         for k in keys_to_delete:
                             del prov_data[rel_type][k]
@@ -406,6 +448,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                     if dst not in archive.namelist():
                         archive.write(src, dst)
                 else:
-                    logger.warning(f"File {src} does not exist.")
+                    logger.warning(f"YPROV: File {src} does not exist.")
         
-        print(f"Successfully created yProv4WFs archive at {path}")
+        print(f"YPROV: Successfully created yProv4WFs archive at {path}")
