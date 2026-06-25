@@ -62,7 +62,7 @@ from typing import (
     Tuple,
     Union,
 )
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from metomi.isodatetime.exceptions import TimePointDumperBoundsError
 import psutil
@@ -259,9 +259,18 @@ def _build_data_info(path):
     return info
 
 
+def _canonical_data_path(path):
+    return os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _data_id_for_path(path):
+    return f"file-{uuid5(NAMESPACE_URL, _canonical_data_path(path))}"
+
+
 def _make_data(path):
-    data = Data(str(uuid4()), str(path))
-    data._info = _build_data_info(str(path))
+    canonical_path = _canonical_data_path(path)
+    data = Data(_data_id_for_path(canonical_path), canonical_path)
+    data._info = _build_data_info(canonical_path)
     return data
 
 
@@ -895,7 +904,7 @@ class Scheduler:
                 self.workflow)
             self.prov_workflow._type = str(self.get_run_mode())
 
-            data_in = Data(str(uuid4()), workflow_files.get_flow_file(self.workflow))
+            data_in = _make_data(workflow_files.get_flow_file(self.workflow))
             self.prov_workflow.add_input(data_in)
             data_in.add_consumer(self.prov_workflow._id)
 
