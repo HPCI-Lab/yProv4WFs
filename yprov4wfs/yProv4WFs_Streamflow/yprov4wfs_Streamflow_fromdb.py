@@ -9,6 +9,7 @@ import os.path
 import uuid
 import json
 import yaml
+import logging
 from abc import abstractmethod
 from zipfile import ZipFile
 from pathlib import Path
@@ -28,6 +29,9 @@ from yprov4wfs.datamodel.workflow import Workflow
 from yprov4wfs.datamodel.task import Task
 from yprov4wfs.datamodel.data import Data
 
+# yprov4wfs uses aiosqlite for its DB access, which logs every single sqlite call
+# we silence it to reduce the spamming except for warnings
+logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 
 def discover_workflow_cwl_files(streamflow_config_path: Optional[str]) -> list[str]:
     """
