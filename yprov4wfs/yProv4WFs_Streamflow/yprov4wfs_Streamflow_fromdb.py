@@ -3,9 +3,8 @@ This module extracts workflow provenance data directly from the StreamFlow datab
 after execution has finished.
 
 Moreover, it includes:
-- CWL crawler for dependency resolving
-- Path normalization for handling multi-tier nested workflows.
-- Complete removal of the Level 0 activity node and its peripheral entities.
+- CWL crawler for finding all cwl files involved
+- Handling multi-tier nested workflows for dependency solving.
 """
 
 import os
@@ -186,12 +185,25 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
 
         logger.info(f"YPROV: Normalized files selected for analysis: {cwl_files}")
 
-        # Rebuild full path map, enforcing normalized canonical naming paths
-        full_path_map = {}
+        # Build an index of loaded CWL contents by their filename
+        cwl_registry = {}
+        for filename in cwl_files:
+            try:
+                real_filename = os.path.abspath(os.path.realpath(filename))
+                with open(real_filename, 'r') as f:
+                    data = yaml.safe_load(f)
+                    if data:
+                        cwl_registry[os.path.basename(filename)] = data
+            except Exception as e:
+                logger.warning(f"YPROV: Error reading file {filename}: {e}")
+                continue
+
+        # Build a set of valid execution paths from the runtime map 
+        # (Prevents duplicate short names from overwriting each other)
+        valid_absolute_paths = set()
         for full_path in self.tasks_by_step_name.keys():
             normalized_path = '/' + full_path.lstrip('/')
-            short_name = normalized_path.split('/')[-1]
-            full_path_map[short_name] = normalized_path
+            valid_absolute_paths.add(normalized_path)
 
         def extract_steps_recursive(workflow_data, current_prefix=""):
             if not isinstance(workflow_data, dict) or workflow_data.get('class') != 'Workflow':
@@ -200,48 +212,86 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
             steps = workflow_data.get('steps', {})
             steps_items = steps.items() if isinstance(steps, dict) else [(s['id'], s) for s in steps]
 
+            sibling_shorts = [step_id.split('/')[-1] for step_id, _ in steps_items]
+
             for step_id, step_val in steps_items:
                 short_step_name = step_id.split('/')[-1]
-                
-                # Formulate hierarchical matching paths for nested structures
-                lookup_name = f"{current_prefix}/{short_step_name}" if current_prefix else short_step_name
-                full_step_name = full_path_map.get(short_step_name) or full_path_map.get(lookup_name.lstrip('/'))
+                full_step_name = f"{current_prefix}/{short_step_name}"
 
-                if full_step_name:
-                    if full_step_name not in dependencies:
-                        dependencies[full_step_name] = []
+                # Unconditionally add every step found in the CWL
+                if full_step_name not in dependencies:
+                    dependencies[full_step_name] = []
+                
+                inputs = step_val.get('in', [])
+                input_list = inputs if isinstance(inputs, list) else [{'source': v} for v in inputs.values()]
+
+                for inp in input_list:
+                    src = inp.get('source') if isinstance(inp, dict) else inp
+                    if src:
+                        sources = src if isinstance(src, list) else [src]
+                        for s in sources:
+                            if '/' in s:
+                                parent_short_name = s.split('/')[0].split('#')[-1]
+                                
+                                if parent_short_name not in sibling_shorts and current_prefix:
+                                    prefix_parts = current_prefix.lstrip('/').split('/')
+                                    if len(prefix_parts) > 1:
+                                        parent_env = "/" + "/".join(prefix_parts[:-1])
+                                        full_parent_name = f"{parent_env}/{parent_short_name}"
+                                    else:
+                                        full_parent_name = f"/{parent_short_name}"
+                                else:
+                                    full_parent_name = f"{current_prefix}/{parent_short_name}"
+
+                                # Unconditionally map the parent relationship
+                                if full_parent_name not in dependencies[full_step_name]:
+                                    dependencies[full_step_name].append(full_parent_name)
+
+                # Recursive check
+                if isinstance(step_val, dict) and 'run' in step_val:
+                    run_target = step_val['run']
+                    next_prefix = f"{current_prefix}/{short_step_name}"
                     
-                    inputs = step_val.get('in', [])
-                    input_list = inputs if isinstance(inputs, list) else [{'source': v} for v in inputs.values()]
-
-                    for inp in input_list:
-                        src = inp.get('source') if isinstance(inp, dict) else inp
-                        if src:
-                            sources = src if isinstance(src, list) else [src]
-                            for s in sources:
-                                if '/' in s:
-                                    parent_short_name = s.split('/')[0]
-                                    parent_lookup = f"{current_prefix}/{parent_short_name}" if current_prefix else parent_short_name
-                                    full_parent_name = full_path_map.get(parent_short_name) or full_path_map.get(parent_lookup.lstrip('/'))
-                                    if full_parent_name and full_parent_name in full_path_map.values() and full_parent_name not in dependencies[full_step_name]:
-                                        dependencies[full_step_name].append(full_parent_name)
-
-                # RECURSIVE CHECK: If step contains an inline nested workflow definition
-                if isinstance(step_val, dict) and 'run' in step_val and isinstance(step_val['run'], dict):
-                    next_prefix = f"{current_prefix}/{short_step_name}" if current_prefix else short_step_name
-                    extract_steps_recursive(step_val['run'], current_prefix=next_prefix)
-
-        for filename in cwl_files:
+                    if isinstance(run_target, dict):
+                        extract_steps_recursive(run_target, current_prefix=next_prefix)
+                    elif isinstance(run_target, str):
+                        target_filename = os.path.basename(run_target)
+                        if target_filename in cwl_registry:
+                            extract_steps_recursive(cwl_registry[target_filename], current_prefix=next_prefix)
+                            
+        # Locate the main root workflow directly from streamflow.yml
+        main_workflow_file = None
+        
+        if streamflow_config_path and os.path.exists(streamflow_config_path):
             try:
-                # Enforce symlink resolution during direct YAML reading
-                real_filename = os.path.abspath(os.path.realpath(filename))
-                with open(real_filename, 'r') as f:
-                    data = yaml.safe_load(f)
+                with open(streamflow_config_path, 'r') as sf:
+                    sf_data = yaml.safe_load(sf)
                 
-                extract_steps_recursive(data)
+                # Dig down into workflows -> config -> file
+                workflows_sec = sf_data.get('workflows', {})
+                for wf_name, wf_val in workflows_sec.items():
+                    wf_config = wf_val.get('config', {})
+                    wf_file_path = wf_config.get('file')
+                    if wf_file_path:
+                        main_workflow_file = os.path.basename(wf_file_path)
+                        logger.info(f"YPROV: Extracted master root workflow from streamflow.yml: {main_workflow_file}")
+                        break
             except Exception as e:
-                logger.warning(f"YPROV: Error recursively mapping file {filename}: {e}")
-                continue
+                logger.warning(f"YPROV: Failed reading streamflow.yml for main entrypoint: {e}")
+
+        # Final safety fallback just in case the file reading fails or structure is unexpected
+        if not main_workflow_file:
+            for base_name, data in cwl_registry.items():
+                if data.get('class') == 'Workflow':
+                    main_workflow_file = base_name
+                    break
+
+        # Kick off parsing
+        if main_workflow_file:
+            logger.info(f"YPROV: Starting hierarchical parsing from root workflow entry point: {main_workflow_file}")
+            extract_steps_recursive(cwl_registry[main_workflow_file], current_prefix="")
+        else:
+            logger.warning("YPROV: Failed to locate a primary master Workflow file to analyze.")
 
         logger.info(f"YPROV Dependencies list computed: {dependencies}")
         return dependencies
