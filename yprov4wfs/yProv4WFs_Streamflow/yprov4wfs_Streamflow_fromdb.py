@@ -3,6 +3,7 @@ This module extracts workflow provenance data directly from the StreamFlow datab
 after execution has finished.
 
 Moreover, it includes:
+- CWL crawler for dependency resolving
 - Path normalization for handling multi-tier nested workflows.
 - Complete removal of the Level 0 activity node and its peripheral entities.
 """
@@ -17,7 +18,7 @@ from abc import abstractmethod
 from zipfile import ZipFile
 from pathlib import Path
 from urllib.parse import urlparse, unquote
-from typing import Any, MutableMapping, MutableSequence, Optional, Set, List, Tuple
+from typing import Any, MutableMapping, MutableSequence, Optional, List, Tuple
 
 import streamflow.core.utils
 from streamflow.core.provenance import ProvenanceManager
@@ -25,7 +26,6 @@ from streamflow.core.workflow import Status, Workflow as StreamFlowWorkflow
 from streamflow.core.context import StreamFlowContext
 from streamflow.core.persistence import DatabaseLoadingContext
 from streamflow.log_handler import logger
-from cwl_utils.parser import load_document_by_uri
 
 from yprov4wfs.datamodel.workflow import Workflow
 from yprov4wfs.datamodel.task import Task
@@ -37,7 +37,7 @@ logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 def discover_workflow_cwl_files(streamflow_config_path: Optional[str]) -> list[str]:
     """
     Parses the primary streamflow.yml deployment config file to isolate the entrypoint,
-    and uses cwl-utils to recursively trace and canonicalize all external CWL files.
+    and safely traverses the YAML structure to recursively find all external CWL files.
     """
     main_cwl = None
     if streamflow_config_path and os.path.exists(streamflow_config_path):
@@ -63,45 +63,48 @@ def discover_workflow_cwl_files(streamflow_config_path: Optional[str]) -> list[s
         logger.warning(f"YPROV: Unable to determine a valid primary CWL file. Resolved: {main_cwl}")
         return []
 
-    cwl_files_paths: Set[str] = set()
+    # Recursively parse YAML to find all 'run: ...cwl' paths
+    to_parse = [os.path.realpath(main_cwl)]
+    discovered_files = set(to_parse)
 
-    def discover_recursive(file_path: str):
-        # Resolve symlink to the absolute physical target path
-        abs_path = os.path.abspath(os.path.realpath(file_path))
-        if abs_path in cwl_files_paths:
-            return
-        cwl_files_paths.add(abs_path)
+    def extract_run_paths(data):
+        """Deep crawler that finds any 'run' key with a .cwl file string."""
+        paths = []
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if k == 'run' and isinstance(v, str) and v.endswith('.cwl'):
+                    paths.append(v)
+                else:
+                    paths.extend(extract_run_paths(v))
+        elif isinstance(data, list):
+            for item in data:
+                paths.extend(extract_run_paths(item))
+        return paths
+
+    while to_parse:
+        current_file = to_parse.pop(0)
+        base_dir = os.path.dirname(current_file)
         
         try:
-            uri = Path(abs_path).resolve().as_uri()
-            doc = load_document_by_uri(uri)
-            process_list = doc if isinstance(doc, list) else [doc]
+            with open(current_file, 'r') as f:
+                content = yaml.safe_load(f) or {}
             
-            for process in process_list:
-                # If this document contains steps (is a workflow)
-                if hasattr(process, 'steps') and process.steps:
-                    for step in process.steps:
-                        if hasattr(step, 'run'):
-                            # Case A: Step runs an external file string
-                            if isinstance(step.run, str):
-                                parsed = urlparse(step.run)
-                                if parsed.scheme in ('file', ''):
-                                    next_file = unquote(parsed.path)
-                                    if not os.path.isabs(next_file):
-                                        next_file = os.path.join(os.path.dirname(abs_path), next_file)
-                                    if os.path.exists(next_file):
-                                        discover_recursive(next_file)
-                            
-                            # Case B: Embedded Inline sub-workflow object (cwl-utils automatically unpacked it)
-                            elif hasattr(step.run, 'steps') and step.run.steps:
-                                # Trigger discovery on the main file again to ensure its internal paths are evaluated
-                                discover_recursive(abs_path)
+            # Find all external files referenced anywhere in this document
+            relative_paths = extract_run_paths(content)
+            
+            for rel_path in relative_paths:
+                # Strip out any URI encoding if present
+                clean_path = unquote(urlparse(rel_path).path)
+                full_path = os.path.realpath(os.path.join(base_dir, clean_path))
+                
+                if full_path not in discovered_files and os.path.exists(full_path):
+                    discovered_files.add(full_path)
+                    to_parse.append(full_path)
+                                
         except Exception as e:
-            logger.warning(f"YPROV: Error parsing graph references for {file_path}: {e}")
+            logger.warning(f"YPROV Warning: Could not deep-parse {current_file}: {e}")
 
-    discover_recursive(main_cwl)
-    return list(cwl_files_paths)
-
+    return list(discovered_files)
 
 class yProv4WFsProvenanceManager(ProvenanceManager):
     """
