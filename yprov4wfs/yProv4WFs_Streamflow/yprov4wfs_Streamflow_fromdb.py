@@ -414,37 +414,46 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                     prov_data["wasInformedBy"][rel_key] = {"prov:informed": c_uuid, "prov:informant": p_uuid}
                     existing_relations.add((c_uuid, p_uuid))
 
+            def _resolve_leaf_tasks(step_name: str) -> List[Task]:
+                """Resolves a CWL step to its leaf tasks via direct or prefix match."""
+                exact_match = self.tasks_by_step_name.get(step_name) or self.tasks_by_step_name.get(f"/{step_name.lstrip('/')}")
+                if exact_match:
+                    return exact_match
+                
+                prefix = f"/{step_name.lstrip('/')}/"
+                child_tasks = []
+                for task_name, tasks in self.tasks_by_step_name.items():
+                    normalized_name = f"/{task_name.lstrip('/')}"
+                    if normalized_name.startswith(prefix):
+                        child_tasks.extend(tasks)
+                return child_tasks
+
             for child_path, parent_paths in self.computed_cwl_deps.items():
-                child_tasks = self.tasks_by_step_name.get(child_path) or self.tasks_by_step_name.get(f"/{child_path.lstrip('/')}")
+                child_tasks = _resolve_leaf_tasks(child_path)
                 if not child_tasks: 
                     continue
 
                 for parent_path in parent_paths:
-                    parent_tasks = self.tasks_by_step_name.get(parent_path) or self.tasks_by_step_name.get(f"/{parent_path.lstrip('/')}")
+                    parent_tasks = _resolve_leaf_tasks(parent_path)
                     if not parent_tasks: 
                         continue
 
                     p_len, c_len = len(parent_tasks), len(child_tasks)
                     
                     if p_len == 1 and c_len > 1:
-                        # One parent informs many children (e.g., standard step to scatter)
                         for c_task in child_tasks: 
                             _inject_edge(parent_tasks[0]._id, c_task._id)
                     elif c_len == 1 and p_len > 1:
-                        # Many parents inform one child (e.g., scatter gather)
                         for p_task in parent_tasks: 
                             _inject_edge(p_task._id, child_tasks[0]._id)
                     elif p_len == c_len:
-                        # Parallel arrays: map 1-to-1 topologically
                         for p_task, c_task in zip(parent_tasks, child_tasks): 
                             _inject_edge(p_task._id, c_task._id)
                     else:
-                        # Fallback brute-force map if iteration counts differ unexpectedly
                         for p_task in parent_tasks:
                             for c_task in child_tasks: 
                                 _inject_edge(p_task._id, c_task._id)
 
-            # Purges any internal engine structural activities (noise) that bled into the graph
             purged_ids = set()
             def check_spur(s: str) -> bool: 
                 return "__" in s or "job" in s.lower() or "-injector" in s.lower() or "-collector" in s.lower() or "-token-transformer" in s.lower() or "-scatter" in s.lower() or "-condition" in s.lower()
@@ -471,7 +480,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                     for k in [k for k, v in prov_data[r_type].items() if any(v.get(p) in purged_ids for p in ["prov:activity", "prov:informant", "prov:informed", "prov:entity"])]:
                         del prov_data[r_type][k]
 
-            # Write final aligned JSON
             with open(json_file_path, 'w') as f: 
                 json.dump(prov_data, f, indent=4)
                 
