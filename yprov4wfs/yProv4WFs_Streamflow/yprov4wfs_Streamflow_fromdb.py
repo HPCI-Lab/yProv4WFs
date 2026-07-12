@@ -15,7 +15,6 @@ import logging
 import hashlib
 from abc import abstractmethod
 from zipfile import ZipFile
-from pathlib import Path
 from urllib.parse import urlparse, unquote
 from typing import Any, MutableMapping, MutableSequence, Optional, List, Tuple
 
