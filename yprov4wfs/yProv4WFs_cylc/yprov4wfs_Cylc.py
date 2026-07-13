@@ -341,6 +341,26 @@ def _select_runtime_context(
     return {}
 
 
+def _freeze_signature_value(value: Any) -> Any:
+    """Convert runtime values into stable, comparable signature values."""
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (str(key), _freeze_signature_value(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (list, tuple, set)):
+        return tuple(_freeze_signature_value(item) for item in value)
+    if isinstance(value, Path):
+        return str(value)
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
 def _derive_job_status(
     submit_status: Any,
     run_status: Any,
@@ -387,7 +407,7 @@ class Scheduler:
     # Intervals in seconds
     INTERVAL_MAIN_LOOP = 1.0
     INTERVAL_MAIN_LOOP_QUICK = 0.5
-    INTERVAL_PROV_SNAPSHOT = 10.0
+    INTERVAL_PROV_SNAPSHOT = 120.0
     INTERVAL_STOP_KILL = 10.0
     INTERVAL_STOP_PROCESS_POOL_EMPTY = 0.5
     INTERVAL_AUTO_RESTART_ERROR = 5
@@ -486,6 +506,11 @@ class Scheduler:
         self._last_prov_snapshot_time: float = 0.0
         self._prov_snapshot_requested = False
         self._prov_final_snapshot_saved = False
+        self._prov_task_cache: Dict[str, Task] = {}
+        self._prov_task_signatures: Dict[str, Any] = {}
+        self._prov_graph_cache_key: Optional[Tuple[Any, ...]] = None
+        self._prov_graph_nodes: List[str] = []
+        self._prov_graph_edges: List[Tuple[str, str]] = []
         # flow information
         self.workflow = id_
         self.workflow_name = get_workflow_name_from_id(self.workflow)
@@ -893,29 +918,146 @@ class Scheduler:
             for row in results
         }
 
-    async def populate_prov_workflow(self, start: str, end: str):
-        """Build and return a Workflow provenance object for the current run."""
-        try:
-            self.prov_workflow = Workflow(self.uuid_str, self.workflow)
-            self.prov_workflow._start_time = start
-            self.prov_workflow._engineWMS = 'Cylc'
-            self.prov_workflow._level = '0'
-            self.prov_workflow._resource_cwl_uri = workflow_files.get_flow_file(
-                self.workflow)
-            self.prov_workflow._type = str(self.get_run_mode())
+    def _new_prov_workflow(self, start: str) -> Workflow:
+        prov_workflow = Workflow(self.uuid_str, self.workflow)
+        prov_workflow._start_time = start
+        prov_workflow._engineWMS = 'Cylc'
+        prov_workflow._level = '0'
+        prov_workflow._resource_cwl_uri = workflow_files.get_flow_file(
+            self.workflow)
+        prov_workflow._type = str(self.get_run_mode())
 
-            data_in = _make_data(workflow_files.get_flow_file(self.workflow))
-            self.prov_workflow.add_input(data_in)
-            data_in.add_consumer(self.prov_workflow._id)
+        data_in = _make_data(workflow_files.get_flow_file(self.workflow))
+        prov_workflow.add_input(data_in)
+        data_in.add_consumer(prov_workflow._id)
+        return prov_workflow
+
+    def _get_prov_graph(self) -> Tuple[List[str], List[Tuple[str, str]]]:
+        stp = self.config.cfg['scheduling']['initial cycle point']
+        ftp = self.config.cfg['scheduling']['final cycle point']
+        graph_cache_key = (
+            self.flow_file,
+            self.flow_file_update_time,
+            str(stp),
+            str(ftp),
+        )
+        if graph_cache_key != self._prov_graph_cache_key:
+            config = get_config(self.workflow, self.options, self.flow_file)
+            nodes, edges = _get_graph_nodes_edges(config, stp, ftp)
+            self._prov_graph_nodes = list(nodes)
+            self._prov_graph_edges = list(edges)
+            self._prov_graph_cache_key = graph_cache_key
+        return self._prov_graph_nodes, self._prov_graph_edges
+
+    @staticmethod
+    def _expanded_prov_paths(
+        runtime_ctx: Dict[str, Any],
+        point: str,
+    ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+        meta = runtime_ctx.get('meta', {})
+        env = dict(os.environ)
+        env.update(runtime_ctx.get('environment', {}))
+        env['CYLC_TASK_CYCLE_POINT'] = point
+        env['CYCLE_DATE'] = point.split('T')[0]
+
+        inputs = tuple(
+            expanded
+            for path in _parse_meta_list(meta.get('yprov_inputs'))
+            if (expanded := _expand_vars(path, env))
+        )
+        outputs = tuple(
+            expanded
+            for path in _parse_meta_list(meta.get('yprov_outputs'))
+            if (expanded := _expand_vars(path, env))
+        )
+        return inputs, outputs
+
+    @staticmethod
+    def _prov_task_signature(
+        task_info: Optional[Tuple[Any, ...]],
+        runtime_ctx: Dict[str, Any],
+        submit_num: int,
+        input_paths: Tuple[str, ...],
+        output_paths: Tuple[str, ...],
+    ) -> Tuple[Any, ...]:
+        summary = runtime_ctx.get('summary', {})
+        runtime_times = (
+            summary.get('started_time_string'),
+            summary.get('finished_time_string'),
+        ) if task_info is None else None
+        return (
+            submit_num,
+            _freeze_signature_value(task_info),
+            _freeze_signature_value(runtime_times),
+            input_paths,
+            output_paths,
+        )
+
+    def _build_prov_task(
+        self,
+        task_name: str,
+        point: str,
+        submit_num: int,
+        task_info: Optional[Tuple[Any, ...]],
+        runtime_ctx: Dict[str, Any],
+        input_paths: Tuple[str, ...],
+        output_paths: Tuple[str, ...],
+    ) -> Task:
+        task = Task(str(uuid4()), task_name)
+        task._level = '1'
+        task.set_id(f"{point}/{task_name}/{submit_num}")
+
+        if task_info is None:
+            summary = runtime_ctx.get('summary', {})
+            task._start_time = summary.get('started_time_string', 'N/A')
+            task._end_time = summary.get('finished_time_string', 'N/A')
+            return task
+
+        task._start_time = task_info[0] or 'N/A'
+        task._end_time = task_info[3] or 'N/A'
+        task._run_platform = task_info[4]
+        task._status = task_info[2]
+        if str(task_info[5]) == "1":
+            task._manual_submit = "manually submitted"
+
+        for input_path in input_paths:
+            for item in _make_data_items(input_path):
+                task.add_input(item)
+        for output_path in output_paths:
+            for item in _make_data_items(output_path):
+                task.add_output(item)
+
+        data_out = _make_data(
+            get_task_job_job_log(
+                self.workflow, point, task_name, submit_num,
+            )
+        )
+        task.add_output(data_out)
+        data_out.set_producer(task._id)
+        return task
+
+    async def populate_prov_workflow(
+        self,
+        start: str,
+        end: str,
+        full: bool = False,
+    ):
+        """Update cached provenance, or rebuild it fully for the final snapshot."""
+        try:
+            if full or not hasattr(self, 'prov_workflow'):
+                self.prov_workflow = self._new_prov_workflow(start)
+                self._prov_task_cache = {}
+                self._prov_task_signatures = {}
+                if full:
+                    self._prov_graph_cache_key = None
 
             task_infos = await self.get_task_infos(self.workflow)
-            config = get_config(self.workflow, self.options, self.flow_file)
-            stp = self.config.cfg['scheduling']['initial cycle point']
-            ftp = self.config.cfg['scheduling']['final cycle point']
-            nodes, edges = _get_graph_nodes_edges(config, stp, ftp)
+            nodes, edges = self._get_prov_graph()
 
-            task_map: Dict[str, Task] = {}
-            task_attempts: Dict[Tuple[str, str], List[Tuple[int, Tuple[Any, ...]]]] = {}
+            task_attempts: Dict[
+                Tuple[str, str],
+                List[Tuple[int, Tuple[Any, ...]]],
+            ] = {}
             for (task_name, point, submit_num), info in task_infos.items():
                 submit_num = _coerce_submit_num(submit_num)
                 if submit_num <= 0:
@@ -926,6 +1068,9 @@ class Scheduler:
             for attempts in task_attempts.values():
                 attempts.sort(key=lambda item: item[0])
 
+            task_map: Dict[str, Task] = {}
+            active_task_ids: Set[str] = set()
+            ordered_task_ids: List[str] = []
             for node in nodes:
                 tokens = Tokens(node, relative=True)
                 task_name = tokens['task']
@@ -937,62 +1082,86 @@ class Scheduler:
                 if not attempts and not runtime_ctx:
                     continue
 
+                input_paths, output_paths = self._expanded_prov_paths(
+                    runtime_ctx, point)
                 latest_task: Optional[Task] = None
                 for submit_num, task_info in attempts:
-                    task = Task(str(uuid4()), task_name)
-                    task._level = '1'
-                    task.set_id(f"{point}/{task_name}/{submit_num}")
-                    task._start_time = task_info[0] or 'N/A'
-                    task._end_time = task_info[3] or 'N/A'
-                    task._run_platform = task_info[4]
-                    task._status = task_info[2]
-                    if str(task_info[5]) == "1":
-                        task._manual_submit = "manually submitted"
-
-                    meta = runtime_ctx.get('meta', {})
-                    env = {}
-                    env.update(os.environ)
-                    env.update(runtime_ctx.get('environment', {}))
-                    env['CYLC_TASK_CYCLE_POINT'] = str(point)
-                    env['CYCLE_DATE'] = str(point).split('T')[0]
-
-                    for input_path in _parse_meta_list(meta.get('yprov_inputs')):
-                        input_path = _expand_vars(input_path, env)
-                        if input_path:
-                            for item in _make_data_items(input_path):
-                                task.add_input(item)
-                    for output_path in _parse_meta_list(meta.get('yprov_outputs')):
-                        output_path = _expand_vars(output_path, env)
-                        if output_path:
-                            for item in _make_data_items(output_path):
-                                task.add_output(item)
-
-                    data_out = _make_data(
-                        get_task_job_job_log(
-                            self.workflow, point, task_name, submit_num,
-                        )
+                    task_id = f"{point}/{task_name}/{submit_num}"
+                    signature = self._prov_task_signature(
+                        task_info,
+                        runtime_ctx,
+                        submit_num,
+                        input_paths,
+                        output_paths,
                     )
-                    task.add_output(data_out)
-                    data_out.set_producer(task._id)
+                    if (
+                        full
+                        or task_id not in self._prov_task_cache
+                        or self._prov_task_signatures.get(task_id) != signature
+                    ):
+                        self._prov_task_cache[task_id] = self._build_prov_task(
+                            task_name,
+                            point,
+                            submit_num,
+                            task_info,
+                            runtime_ctx,
+                            input_paths,
+                            output_paths,
+                        )
+                        self._prov_task_signatures[task_id] = signature
 
-                    self.prov_workflow.add_task(task)
-                    latest_task = task
+                    latest_task = self._prov_task_cache[task_id]
+                    active_task_ids.add(task_id)
+                    ordered_task_ids.append(task_id)
 
                 if latest_task is None and runtime_ctx:
-                    summary = runtime_ctx.get('summary', {})
-                    submit_num = _coerce_submit_num(runtime_ctx.get('submit_num'))
+                    submit_num = _coerce_submit_num(
+                        runtime_ctx.get('submit_num'))
                     if submit_num > 0:
-                        task = Task(str(uuid4()), task_name)
-                        task._level = '1'
-                        task.set_id(f"{point}/{task_name}/{submit_num}")
-                        task._start_time = summary.get('started_time_string', 'N/A')
-                        task._end_time = summary.get('finished_time_string', 'N/A')
-                        self.prov_workflow.add_task(task)
-                        latest_task = task
+                        task_id = f"{point}/{task_name}/{submit_num}"
+                        signature = self._prov_task_signature(
+                            None,
+                            runtime_ctx,
+                            submit_num,
+                            input_paths,
+                            output_paths,
+                        )
+                        if (
+                            full
+                            or task_id not in self._prov_task_cache
+                            or self._prov_task_signatures.get(task_id)
+                            != signature
+                        ):
+                            self._prov_task_cache[
+                                task_id
+                            ] = self._build_prov_task(
+                                task_name,
+                                point,
+                                submit_num,
+                                None,
+                                runtime_ctx,
+                                input_paths,
+                                output_paths,
+                            )
+                            self._prov_task_signatures[task_id] = signature
+                        latest_task = self._prov_task_cache[task_id]
+                        active_task_ids.add(task_id)
+                        ordered_task_ids.append(task_id)
 
                 if latest_task is not None:
                     task_map[node] = latest_task
 
+            for task_id in set(self._prov_task_cache) - active_task_ids:
+                self._prov_task_cache.pop(task_id, None)
+                self._prov_task_signatures.pop(task_id, None)
+
+            self.prov_workflow._tasks = [
+                self._prov_task_cache[task_id]
+                for task_id in dict.fromkeys(ordered_task_ids)
+            ]
+            for task in self.prov_workflow._tasks:
+                task._prev = []
+                task._next = []
             for left, right in edges:
                 left_task = task_map.get(left)
                 right_task = task_map.get(right)
@@ -1029,7 +1198,9 @@ class Scheduler:
 
         wf_stop = datetime.now().isoformat()
         prov_workflow = await self.populate_prov_workflow(
-            self._prov_workflow_start, wf_stop,
+            self._prov_workflow_start,
+            wf_stop,
+            full=final,
         )
         if prov_workflow is None:
             return None
