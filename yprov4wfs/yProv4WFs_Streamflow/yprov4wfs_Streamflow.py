@@ -5,7 +5,7 @@ to manage task executions.
 
 It mirrors the logic used for the offline version to ensure a correct output.
 
-To enable a simple switching between the original and plugin version, a python environment 
+To enable simple switching between the original and plugin version, a python environment 
 parameter is used as follows:
 
 If you want to run the ORIGINAL version:
@@ -13,7 +13,7 @@ If you want to run the ORIGINAL version:
 - Run USE_YPROV=false streamflow run
 
 If you want to run the PLUGIN version:
-- Run exactly USE_YPROV=true streamflow run
+- Run USE_YPROV=true streamflow run
 
 The default behavior is the usage of the original version.
 """
@@ -30,6 +30,7 @@ import yaml
 import atexit
 import logging
 import hashlib
+import traceback
 from collections.abc import MutableMapping, MutableSequence
 from typing import TYPE_CHECKING, cast, Optional, Set, List, Tuple
 from urllib.parse import urlparse, unquote
@@ -38,7 +39,7 @@ from zipfile import ZipFile
 from streamflow.core import utils
 from streamflow.core import utils as sf_utils
 from streamflow.core.exception import WorkflowExecutionException
-from streamflow.core.workflow import Executor, Status
+from streamflow.core.workflow import Executor, Status, Step
 from streamflow.log_handler import logger
 from streamflow.workflow.token import TerminationToken
 from streamflow.workflow.utils import get_token_value
@@ -51,13 +52,73 @@ if TYPE_CHECKING:
     from typing import Any
     from streamflow.core.workflow import Workflow
 
-# Silence aiosqlite background logging
+# Silence noisy database logs
 logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 
-# The original version run by default if unless specified differently
-if os.getenv("USE_YPROV", "").lower() == "true":
+# Environment trigger check
+USE_YPROV = os.getenv("USE_YPROV", "").lower() == "true"
+
+def _yprov_log(msg: str, level: str = "info"):
+    """Guaranteed unbuffered console log helper."""
+    prefix = f"[YPROV ONLINE PLUGIN] {msg}\n"
+    sys.stderr.write(prefix)
+    sys.stderr.flush()
+    if level == "error":
+        logger.error(prefix.strip())
+    elif level == "warning":
+        logger.warning(prefix.strip())
+    else:
+        logger.info(prefix.strip())
+
+def _is_system_spur(name: str) -> bool:
+    """Check if a step, port, or entity is an internal StreamFlow runtime component."""
+    clean = name.lstrip('/').lower()
+    system_keywords = [
+        "__",
+        "token-transformer",
+        "scatter-combinator",
+        "scatter-size-transformer",
+        "default-transformer",
+        "transformer",
+        "injector",
+        "collector",
+        "scatter",
+        "combinator",
+        "broadcaster",
+    ]
+    return any(kw in clean for kw in system_keywords)
+
+def _generate_entity_id(step_name: str, port_label: str, p_type: str, p_val: str, p_loc: str, is_output: bool = False) -> str:
+    """
+    Generate deterministic Entity IDs scoped strictly to data identity or step/port.
+    Excludes task execution UUIDs to ensure scatter tasks share common entities.
+    """
+    clean_step = step_name.lstrip('/')
+
+    # File or directory entity with valid path/location
+    if p_loc and p_loc != "None":
+        return f"ent_file_{hashlib.md5(p_loc.encode()).hexdigest()[:12]}"
+    
+    # Value/primitive parameter (deduplicated per step & value)
+    if p_val and p_val != "None":
+        raw_key = f"{clean_step}_{port_label}_{p_val}"
+        return f"ent_val_{hashlib.md5(raw_key.encode()).hexdigest()[:12]}"
+    
+    # Dynamic output port entity (shared across scatter iterations of this step)
+    if is_output:
+        raw_key = f"{clean_step}_{port_label}_out"
+        return f"ent_out_{hashlib.md5(raw_key.encode()).hexdigest()[:12]}"
+
+    # Input fallback port entity
+    raw_key = f"{clean_step}_{port_label}_in"
+    return f"ent_in_{hashlib.md5(raw_key.encode()).hexdigest()[:12]}"
+
+
+if USE_YPROV:
+    _yprov_log("USE_YPROV=true: INITIALIZING STREAMFLOW EXECUTOR")
+
     #--------------------------------------------
-    # YPROV PLUGIN INTEGRATION
+    # CWL DEPENDENCY PARSING HELPERS
     #--------------------------------------------
 
     def discover_workflow_cwl_files(streamflow_config_path: Optional[str]) -> list[str]:
@@ -78,7 +139,7 @@ if os.getenv("USE_YPROV", "").lower() == "true":
                         config_dir = os.path.dirname(real_config_path)
                         main_cwl = os.path.abspath(os.path.realpath(os.path.join(config_dir, main_cwl_relative)))
             except Exception as e:
-                logger.warning(f"YPROV: Error parsing streamflow.yml ({streamflow_config_path}): {e}")
+                _yprov_log(f"Error reading streamflow.yml ({streamflow_config_path}): {e}", "warning")
 
         if not main_cwl or not os.path.exists(main_cwl):
             return []
@@ -115,17 +176,48 @@ if os.getenv("USE_YPROV", "").lower() == "true":
                         discovered_files.add(full_path)
                         to_parse.append(full_path)
             except Exception as e:
-                logger.warning(f"YPROV Warning: Could not deep-parse {current_file}: {e}")
+                _yprov_log(f"Could not deep-parse {current_file}: {e}", "warning")
         
-        logger.info(f"YPROV: Normalized files selected for analysis: {list(discovered_files)}")
+        _yprov_log(f"Discovered CWL target files: {list(discovered_files)}")
         return list(discovered_files)
 
+    def _get_action_status(status: Status) -> str:
+        if status == Status.COMPLETED:
+            return "Completed"
+        elif status == Status.FAILED:
+            return "Failed"
+        elif status in [Status.CANCELLED, Status.SKIPPED]:
+            return "Cancelled or Skipped"
+        return "Completed"
+
+    def _extract_memory_port_metadata(port_obj: Any) -> Tuple[str, str, str]:
+        p_type, p_val, p_loc = "string", "None", "None"
+        try:
+            tokens = getattr(port_obj, 'tokens', getattr(port_obj, '_tokens', []))
+            if tokens and len(tokens) > 0:
+                val = tokens[-1].data
+                if isinstance(val, dict):
+                    p_type = val.get("class", "File" if "path" in val or "location" in val else "string")
+                    p_loc = val.get("location", val.get("path", "None"))
+                    p_val = os.path.basename(p_loc) if p_loc != "None" else str(val)
+                elif isinstance(val, list):
+                    p_type = "array"
+                    p_val = str([v.get("location") if isinstance(v, dict) else str(v) for v in val])
+                elif val is not None:
+                    p_type = type(val).__name__
+                    p_val = str(val)
+        except Exception:
+            pass
+        return p_type, p_val, p_loc
+
+    #--------------------------------------------
+    # STREAMFLOW EXECUTOR PLUGIN
+    #--------------------------------------------
 
     class StreamFlowExecutor(Executor):
         """
-        Custom scheduler mapping directly to StreamFlow's execution flow.
-        Intercepts the operational loop to dynamically gather telemetry constraints,
-        query state inputs from internal relational databases and serialize PROV-JSON.
+        Custom StreamFlow Executor Engine. Wraps task steps natively during execution
+        and flushes PROV-JSON files immediately upon step completion.
         """
         def __init__(self, workflow: Workflow):
             super().__init__(workflow)
@@ -134,72 +226,382 @@ if os.getenv("USE_YPROV", "").lower() == "true":
             self.received: MutableSequence[str] = []
             self.closed: bool = False
 
-            logger.info("YPROV: Starting and loading workflows...")
+            _yprov_log("StreamFlowExecutor instance created successfully.")
 
-            # --- yProv4Wfs state ---
             self.map_file: MutableMapping[str, str] = {}
             self.prov_workflow = None
             self.tasks_by_step_name = {}
-            self.completed_step_paths: Set[str] = set()
+            self.job_recorded_steps = set()
             self.computed_cwl_deps = {}
             self.streamflow_config_path = "streamflow.yml"
             self.map_file["config"] = self.streamflow_config_path
             self.outdir = "./outputs"
 
-        def _get_action_status(self, status: Status) -> str:
-            """Maps framework internal execution status enumerations to controlled strings."""
-            if status == Status.COMPLETED: return "Completed"
-            elif status == Status.FAILED: return "Failed"
-            elif status in [Status.CANCELLED, Status.SKIPPED]: return "Cancelled or Skipped"
-            return "Running"
+        def _is_valid_cwl_step(self, clean_name: str) -> bool:
+            """Exact whitelist match against known CWL step hierarchy."""
+            if not self.computed_cwl_deps:
+                return True
 
-        def _extract_port_metadata(self, port_db_record: Any) -> Tuple[str, str, str]:
-            """
-            Parses database JSON records or dictionary attributes tracking data ports
-            to safely extract the structural datatype, value reference, and file location metadata.
-            """
-            p_type = "string"
-            p_val = "None"
-            p_loc = "None"
-            try:
-                val = port_db_record.get("value")
-                if isinstance(val, str) and (val.startswith("{") or val.startswith("[")):
-                    try: 
-                        val = json.loads(val)
-                    except Exception: 
-                        pass
-                        
-                if isinstance(val, dict):
-                    p_type = val.get("class", "File" if "path" in val or "location" in val else "string")
-                    p_loc = val.get("location") or val.get("path") or "None"
-                    p_val = os.path.basename(p_loc) if p_loc != "None" else str(val)
-                elif isinstance(val, list):
-                    p_type = "array"
-                    p_val = str([v.get("location") if isinstance(v, dict) else str(v) for v in val])
-                elif val is not None:
-                    p_type = type(val).__name__
-                    p_val = str(val)
-            except Exception: 
-                pass
+            formatted = f"/{clean_name.lstrip('/')}"
+            return formatted in self.computed_cwl_deps
+
+        def _attach_step_monitors(self, step: Step):
+            """Dynamically intercept low-level job execution to trace individual scatter steps."""
+            clean_name = step.name.lstrip('/')
+            if not self._is_valid_cwl_step(clean_name):
+                return
+
+            candidate_methods = [
+                '_execute_job',
+                '_run_job',
+                '_execute',
+                '_process_job',
+                '_execute_step',
+                'execute'
+            ]
+
+            for method_name in candidate_methods:
+                if hasattr(step, method_name):
+                    orig_method = getattr(step, method_name)
+                    if callable(orig_method) and not getattr(orig_method, '_is_yprov_hook', False):
+                        if asyncio.iscoroutinefunction(orig_method):
+                            async def wrapper(*args, **kwargs):
+                                start_ns = time.time_ns()
+                                try:
+                                    res = await orig_method(*args, **kwargs)
+                                    end_ns = time.time_ns()
+                                    self._on_job_complete(step, start_ns, end_ns, status=Status.COMPLETED)
+                                    return res
+                                except Exception:
+                                    end_ns = time.time_ns()
+                                    self._on_job_complete(step, start_ns, end_ns, status=Status.FAILED)
+                                    raise
+                            wrapper._is_yprov_hook = True
+                            setattr(step, method_name, wrapper)
+                        else:
+                            def wrapper(*args, **kwargs):
+                                start_ns = time.time_ns()
+                                try:
+                                    res = orig_method(*args, **kwargs)
+                                    end_ns = time.time_ns()
+                                    self._on_job_complete(step, start_ns, end_ns, status=Status.COMPLETED)
+                                    return res
+                                except Exception:
+                                    end_ns = time.time_ns()
+                                    self._on_job_complete(step, start_ns, end_ns, status=Status.FAILED)
+                                    raise
+                            wrapper._is_yprov_hook = True
+                            setattr(step, method_name, wrapper)
+
+        def _on_job_complete(self, step: Step, start_time_ns: int, end_time_ns: int, status: Status = Status.COMPLETED):
+            clean_name = step.name.lstrip('/')
+            if not self._is_valid_cwl_step(clean_name):
+                return
+
+            self.job_recorded_steps.add(clean_name)
+            task_id = str(uuid.uuid4())
+
+            task = YProvTask(task_id, clean_name)
+            task._start_time = sf_utils.get_date_from_ns(start_time_ns)
+            task._end_time = sf_utils.get_date_from_ns(end_time_ns)
+            task._status = _get_action_status(status)
+            task._level = '1'
+
+            # Extract Inputs
+            in_ports = step.get_input_ports() if hasattr(step, 'get_input_ports') else getattr(step, 'input_ports', {})
+            for port_name, port_obj in in_ports.items():
+                port_label = port_name.split('/')[-1]
+                if _is_system_spur(port_label) or _is_system_spur(port_name):
+                    continue
+                dt, dv, dl = _extract_memory_port_metadata(port_obj)
+                data_id = _generate_entity_id(clean_name, port_label, dt, dv, dl, is_output=False)
                 
-            return p_type, p_val, p_loc
+                data_in = YProvData(data_id, port_label)
+                data_in._type, data_in._value, data_in._location = dt, dv, dl
+                task.add_input(data_in)
+                data_in.add_consumer(task._id)
+
+            # Extract Outputs
+            out_ports = step.get_output_ports() if hasattr(step, 'get_output_ports') else getattr(step, 'output_ports', {})
+            for port_name, port_obj in out_ports.items():
+                port_label = port_name.split('/')[-1]
+                if _is_system_spur(port_label) or _is_system_spur(port_name):
+                    continue
+                dt, dv, dl = _extract_memory_port_metadata(port_obj)
+                data_id = _generate_entity_id(clean_name, port_label, dt, dv, dl, is_output=True)
+
+                data_out = YProvData(data_id, port_label)
+                data_out._type, data_out._value, data_out._location = dt, dv, dl
+                task.add_output(data_out)
+                data_out.set_producer(task._id)
+
+            self.register_and_flush_task(clean_name, task)
+
+        async def _run_monitored_step(self, step: Step) -> Any:
+            """Direct Coroutine Wrapper replacing monkey-patching completely."""
+            clean_name = step.name.lstrip('/')
+            is_valid = self._is_valid_cwl_step(clean_name)
+
+            if is_valid:
+                _yprov_log(f"[STEP START] Launching execution for step: '{clean_name}'")
+
+            start_time_ns = time.time_ns()
+            self._attach_step_monitors(step)
+
+            try:
+                result = await step.run()
+                end_time_ns = time.time_ns()
+                
+                if is_valid:
+                    duration = (end_time_ns - start_time_ns) / 1e9
+                    _yprov_log(f"[STEP COMPLETE] Step '{clean_name}' finished in {duration:.2f}s")
+
+                    if clean_name not in self.job_recorded_steps:
+                        self._on_step_complete(step, start_time_ns, end_time_ns, status=Status.COMPLETED)
+
+                return result
+            except Exception as e:
+                end_time_ns = time.time_ns()
+                if is_valid:
+                    _yprov_log(f"[STEP FAILED] Step '{clean_name}' raised an exception: {e}\n{traceback.format_exc()}", level="error")
+                    if clean_name not in self.job_recorded_steps:
+                        self._on_step_complete(step, start_time_ns, end_time_ns, status=Status.FAILED)
+                raise
+
+        def _on_step_complete(self, step: Step, start_time_ns: int, end_time_ns: int, status: Status = Status.COMPLETED):
+            clean_name = step.name.lstrip('/')
+
+            if not self._is_valid_cwl_step(clean_name):
+                return
+
+            task_id = str(uuid.uuid4())
+            task = YProvTask(task_id, clean_name)
+            task._start_time = sf_utils.get_date_from_ns(start_time_ns)
+            task._end_time = sf_utils.get_date_from_ns(end_time_ns)
+            task._status = _get_action_status(status)
+            task._level = '1'
+
+            # Extract Inputs
+            in_ports = step.get_input_ports() if hasattr(step, 'get_input_ports') else getattr(step, 'input_ports', {})
+            for port_name, port_obj in in_ports.items():
+                port_label = port_name.split('/')[-1]
+                if _is_system_spur(port_label) or _is_system_spur(port_name):
+                    continue
+                dt, dv, dl = _extract_memory_port_metadata(port_obj)
+                data_id = _generate_entity_id(clean_name, port_label, dt, dv, dl, is_output=False)
+
+                data_in = YProvData(data_id, port_label)
+                data_in._type, data_in._value, data_in._location = dt, dv, dl
+                task.add_input(data_in)
+                data_in.add_consumer(task._id)
+
+            # Extract Outputs
+            out_ports = step.get_output_ports() if hasattr(step, 'get_output_ports') else getattr(step, 'output_ports', {})
+            for port_name, port_obj in out_ports.items():
+                port_label = port_name.split('/')[-1]
+                if _is_system_spur(port_label) or _is_system_spur(port_name):
+                    continue
+                dt, dv, dl = _extract_memory_port_metadata(port_obj)
+                data_id = _generate_entity_id(clean_name, port_label, dt, dv, dl, is_output=True)
+
+                data_out = YProvData(data_id, port_label)
+                data_out._type, data_out._value, data_out._location = dt, dv, dl
+                task.add_output(data_out)
+                data_out.set_producer(task._id)
+
+            self.register_and_flush_task(clean_name, task)
+
+        def register_and_flush_task(self, clean_name: str, task: YProvTask) -> None:
+            if not self.prov_workflow:
+                _yprov_log("Cannot flush data: prov_workflow is not initialized.", level="warning")
+                return
+
+            self.prov_workflow.add_task(task)
+            
+            if clean_name not in self.tasks_by_step_name:
+                self.tasks_by_step_name[clean_name] = []
+            self.tasks_by_step_name[clean_name].append(task)
+            
+            self._flush_prov_json()
+
+        def _flush_prov_json(self) -> Optional[str]:
+            try:
+                os.makedirs(self.outdir, exist_ok=True)
+                json_file_path = self.prov_workflow.prov_to_json()  
+                if not json_file_path or not os.path.exists(json_file_path):
+                    _yprov_log("yprov4wfs prov_to_json() returned empty path.", level="error")
+                    return None
+
+                with open(json_file_path, 'r') as f:
+                    prov_data = json.load(f)
+
+                # -----------------------------------------------------------
+                # STRICT WHITELIST & ENTITY FILTERING
+                # -----------------------------------------------------------
+                allowed_cwl_keys = set(self.computed_cwl_deps.keys()) if self.computed_cwl_deps else set()
+
+                def is_valid_cwl_activity(label: str) -> bool:
+                    if not allowed_cwl_keys:
+                        return True
+                    formatted = f"/{label.lstrip('/')}"
+                    return formatted in allowed_cwl_keys
+
+                def _get_prov_id(val: Any) -> Optional[str]:
+                    if isinstance(val, str):
+                        return val
+                    if isinstance(val, dict):
+                        return val.get("$") or val.get("prov:id")
+                    return None
+
+                def _get_prov_label(val: Any) -> str:
+                    if isinstance(val, dict):
+                        label = val.get("prov:label") or val.get("yprov:name") or val.get("yprov:label") or ""
+                        if isinstance(label, dict):
+                            return label.get("$", "")
+                        return str(label)
+                    return str(val) if val else ""
+
+                # Purge non-CWL activities
+                valid_activity_ids = set()
+                activities = prov_data.get("activity", {})
+                for act_id, act_val in list(activities.items()):
+                    label = _get_prov_label(act_val)
+                    if not label:
+                        for v in act_val.values() if isinstance(act_val, dict) else []:
+                            v_str = _get_prov_id(v) or str(v)
+                            if is_valid_cwl_activity(v_str):
+                                label = v_str
+                                break
+                    
+                    if label and is_valid_cwl_activity(label):
+                        valid_activity_ids.add(act_id)
+                    else:
+                        del activities[act_id]
+
+                # Filter out system spur entities
+                entities = prov_data.get("entity", {})
+                candidate_entity_ids = set()
+                for ent_id, ent_val in list(entities.items()):
+                    label = _get_prov_label(ent_val) or ent_id
+                    if _is_system_spur(label) or _is_system_spur(ent_id):
+                        del entities[ent_id]
+                    else:
+                        candidate_entity_ids.add(ent_id)
+
+                # Clean up relations referring to purged activities or spur entities
+                referenced_entity_ids = set()
+
+                for r_type in ["used", "wasGeneratedBy"]:
+                    if r_type in prov_data:
+                        cleaned_rels = {}
+                        for rel_id, rel_val in prov_data[r_type].items():
+                            if not isinstance(rel_val, dict):
+                                continue
+                            act_id = _get_prov_id(rel_val.get("prov:activity"))
+                            ent_id = _get_prov_id(rel_val.get("prov:entity"))
+                            
+                            if act_id in valid_activity_ids and ent_id in candidate_entity_ids:
+                                cleaned_rels[rel_id] = rel_val
+                                if ent_id:
+                                    referenced_entity_ids.add(ent_id)
+                        prov_data[r_type] = cleaned_rels
+
+                if "wasAssociatedWith" in prov_data:
+                    prov_data["wasAssociatedWith"] = {
+                        k: v for k, v in prov_data["wasAssociatedWith"].items()
+                        if isinstance(v, dict) and _get_prov_id(v.get("prov:activity")) in valid_activity_ids
+                    }
+
+                if "wasDerivedFrom" in prov_data:
+                    cleaned_derived = {}
+                    for rel_id, rel_val in prov_data["wasDerivedFrom"].items():
+                        if not isinstance(rel_val, dict):
+                            continue
+                        gen_ent = _get_prov_id(rel_val.get("prov:generatedEntity"))
+                        used_ent = _get_prov_id(rel_val.get("prov:usedEntity"))
+                        if gen_ent in referenced_entity_ids and used_ent in referenced_entity_ids:
+                            cleaned_derived[rel_id] = rel_val
+                    prov_data["wasDerivedFrom"] = cleaned_derived
+
+                # Clean up orphan / unreferenced entities
+                if "entity" in prov_data:
+                    prov_data["entity"] = {
+                        ent_id: ent_val for ent_id, ent_val in prov_data["entity"].items()
+                        if ent_id in referenced_entity_ids
+                    }
+
+                # Re-inject explicit step-to-step dependencies (wasInformedBy) between valid tasks
+                prov_data["wasInformedBy"] = {} 
+                existing_relations = set()
+
+                def _inject_edge(p_uuid: str, c_uuid: str) -> None:
+                    if p_uuid != c_uuid and (c_uuid, p_uuid) not in existing_relations:
+                        if p_uuid in valid_activity_ids and c_uuid in valid_activity_ids:
+                            rel_key = f"_:informed_{hashlib.md5(f'{c_uuid}{p_uuid}'.encode()).hexdigest()[:8]}"
+                            prov_data["wasInformedBy"][rel_key] = {"prov:informed": c_uuid, "prov:informant": p_uuid}
+                            existing_relations.add((c_uuid, p_uuid))
+
+                def _resolve_leaf_tasks(step_name: str) -> List[Any]:
+                    clean_s = step_name.lstrip('/')
+                    exact_match = (
+                        self.tasks_by_step_name.get(clean_s) 
+                        or self.tasks_by_step_name.get(f"/{clean_s}")
+                    )
+                    if exact_match:
+                        return [t for t in exact_match if t._id in valid_activity_ids]
+                    
+                    prefix = f"{clean_s}/"
+                    child_tasks = []
+                    for task_name, tasks in self.tasks_by_step_name.items():
+                        normalized_name = task_name.lstrip('/')
+                        if normalized_name.startswith(prefix):
+                            child_tasks.extend([t for t in tasks if t._id in valid_activity_ids])
+                    return child_tasks
+
+                for child_path, parent_paths in self.computed_cwl_deps.items():
+                    child_tasks = _resolve_leaf_tasks(child_path)
+                    if not child_tasks: 
+                        continue
+
+                    for parent_path in parent_paths:
+                        parent_tasks = _resolve_leaf_tasks(parent_path)
+                        if not parent_tasks: 
+                            continue
+
+                        p_len, c_len = len(parent_tasks), len(child_tasks)
+                        
+                        if p_len == 1 and c_len > 1:
+                            for c_task in child_tasks: _inject_edge(parent_tasks[0]._id, c_task._id)
+                        elif c_len == 1 and p_len > 1:
+                            for p_task in parent_tasks: _inject_edge(p_task._id, child_tasks[0]._id)
+                        elif p_len == c_len:
+                            for p_task, c_task in zip(parent_tasks, child_tasks): _inject_edge(p_task._id, c_task._id)
+                        else:
+                            for p_task in parent_tasks:
+                                for c_task in child_tasks: _inject_edge(p_task._id, c_task._id)
+
+                # Write cleaned JSON back to disk
+                with open(json_file_path, 'w') as f:
+                    json.dump(prov_data, f, indent=4)
+
+                file_size = os.path.getsize(json_file_path)
+                _yprov_log(f"[FLUSH SUCCESS] Updated JSON written to: {json_file_path} ({file_size} bytes)")
+
+                return json_file_path
+
+            except Exception as e:
+                _yprov_log(f"JSON Flush Error: {e}\n{traceback.format_exc()}", level="error")
+                return None
 
         def _parse_cwl_for_dependencies(self) -> MutableMapping[str, List[str]]:
-            """
-            Inspects structural CWL workflow graphs recursively to deduce correct task 
-            input-to-output dependencies, fully supporting inline and nested steps.
-            """
             dependencies = {}
             streamflow_config_path = self.map_file.get("config")
             cwl_files = discover_workflow_cwl_files(streamflow_config_path)
 
             if not cwl_files:
-                logger.warning("YPROV: No active CWL files discovered via graph parsing.")
+                _yprov_log("No CWL files found to parse dependencies.", level="warning")
                 return dependencies
 
-            logger.info(f"YPROV: Normalized files selected for analysis: {cwl_files}")
-
-            # Build an index of loaded CWL contents by their filename
             cwl_registry = {}
             for filename in cwl_files:
                 try:
@@ -209,15 +611,8 @@ if os.getenv("USE_YPROV", "").lower() == "true":
                         if data:
                             cwl_registry[os.path.basename(filename)] = data
                 except Exception as e:
-                    logger.warning(f"YPROV: Error reading file {filename}: {e}")
+                    _yprov_log(f"Error reading CWL file {filename}: {e}", level="warning")
                     continue
-
-            # Build a set of valid execution paths from the runtime map 
-            # (Prevents duplicate short names from overwriting each other)
-            valid_absolute_paths = set()
-            for full_path in self.tasks_by_step_name.keys():
-                normalized_path = '/' + full_path.lstrip('/')
-                valid_absolute_paths.add(normalized_path)
 
             def extract_steps_recursive(workflow_data, current_prefix=""):
                 if not isinstance(workflow_data, dict) or workflow_data.get('class') != 'Workflow':
@@ -225,14 +620,12 @@ if os.getenv("USE_YPROV", "").lower() == "true":
                 
                 steps = workflow_data.get('steps', {})
                 steps_items = steps.items() if isinstance(steps, dict) else [(s['id'], s) for s in steps]
-
                 sibling_shorts = [step_id.split('/')[-1] for step_id, _ in steps_items]
 
                 for step_id, step_val in steps_items:
                     short_step_name = step_id.split('/')[-1]
                     full_step_name = f"{current_prefix}/{short_step_name}"
 
-                    # Unconditionally add every step found in the CWL
                     if full_step_name not in dependencies:
                         dependencies[full_step_name] = []
                     
@@ -246,7 +639,6 @@ if os.getenv("USE_YPROV", "").lower() == "true":
                             for s in sources:
                                 if '/' in s:
                                     parent_short_name = s.split('/')[0].split('#')[-1]
-                                    
                                     if parent_short_name not in sibling_shorts and current_prefix:
                                         prefix_parts = current_prefix.lstrip('/').split('/')
                                         if len(prefix_parts) > 1:
@@ -257,11 +649,9 @@ if os.getenv("USE_YPROV", "").lower() == "true":
                                     else:
                                         full_parent_name = f"{current_prefix}/{parent_short_name}"
 
-                                    # Unconditionally map the parent relationship
                                     if full_parent_name not in dependencies[full_step_name]:
                                         dependencies[full_step_name].append(full_parent_name)
 
-                    # Recursive check
                     if isinstance(step_val, dict) and 'run' in step_val:
                         run_target = step_val['run']
                         next_prefix = f"{current_prefix}/{short_step_name}"
@@ -273,46 +663,34 @@ if os.getenv("USE_YPROV", "").lower() == "true":
                             if target_filename in cwl_registry:
                                 extract_steps_recursive(cwl_registry[target_filename], current_prefix=next_prefix)
                                 
-            # Locate the main root workflow directly from streamflow.yml
             main_workflow_file = None
-            
             if streamflow_config_path and os.path.exists(streamflow_config_path):
                 try:
                     with open(streamflow_config_path, 'r') as sf:
                         sf_data = yaml.safe_load(sf)
-                    
-                    # Dig down into workflows -> config -> file
                     workflows_sec = sf_data.get('workflows', {})
                     for wf_name, wf_val in workflows_sec.items():
                         wf_config = wf_val.get('config', {})
                         wf_file_path = wf_config.get('file')
                         if wf_file_path:
                             main_workflow_file = os.path.basename(wf_file_path)
-                            logger.info(f"YPROV: Extracted master root workflow from streamflow.yml: {main_workflow_file}")
+                            _yprov_log(f"Extracted root workflow file from streamflow.yml: {main_workflow_file}")
                             break
                 except Exception as e:
-                    logger.warning(f"YPROV: Failed reading streamflow.yml for main entrypoint: {e}")
+                    _yprov_log(f"Failed reading streamflow.yml: {e}", level="warning")
 
-            # Final safety fallback just in case the file reading fails or structure is unexpected
             if not main_workflow_file:
                 for base_name, data in cwl_registry.items():
                     if data.get('class') == 'Workflow':
                         main_workflow_file = base_name
                         break
 
-            # Kick off parsing
             if main_workflow_file:
-                logger.info(f"YPROV: Starting hierarchical parsing from root workflow entry point: {main_workflow_file}")
+                _yprov_log(f"Parsing CWL hierarchy starting at root: {main_workflow_file}")
                 extract_steps_recursive(cwl_registry[main_workflow_file], current_prefix="")
-            else:
-                logger.warning("YPROV: Failed to locate a primary master Workflow file to analyze.")
 
-            logger.info(f"YPROV Dependencies list computed: {dependencies}")
+            _yprov_log(f"Computed CWL Dependency Graph: {dependencies}")
             return dependencies
-
-        async def _monitored_step_run(self, step: Any, task_name: str):
-            """Passes scheduling handles straight to StreamFlow to maintain maximum execution speed."""
-            await step.run()
 
         async def _handle_exception(self, task: asyncio.Task):
             try:
@@ -377,21 +755,38 @@ if os.getenv("USE_YPROV", "").lower() == "true":
 
         async def run(self) -> MutableMapping[str, Any]:
             """
-            Executes the workflow graph. Once execution finishes, it uses an in-memory aligned
-            extraction model to capture scattered task states, align them with CWL 
-            dependencies, apply filtering rules and bundle the final archive.
+            Executes the workflow graph with native step monitoring and progressive JSON flushing.
             """
             try:
                 output_tokens = {}
-                logger.info(f"Workflow ID {self.workflow.persistent_id}")
-
+                _yprov_log(f"Starting execution loop for Workflow ID: {self.workflow.persistent_id}")
+                _yprov_log(f"Discovered total steps in workflow object: {len(self.workflow.steps)}")
+                
+                start_time_root_ns = time.time_ns()
                 await self.workflow.context.database.update_workflow(
-                    self.workflow.persistent_id, {"start_time": time.time_ns()}
+                    self.workflow.persistent_id, {"start_time": start_time_root_ns}
                 )
 
+                # Initialize master workflow wrapper & parse CWL dependencies upfront
+                self.prov_workflow = YProvWorkflow(self.workflow.name, f'workflow_{self.workflow.name}')
+                self.prov_workflow._start_time = sf_utils.get_date_from_ns(start_time_root_ns)
+                self.prov_workflow._engineWMS = 'StreamFlow'
+                self.prov_workflow._level = '0'
+                if "config" in self.map_file: 
+                    self.prov_workflow._resource_cwl_uri = self.map_file["config"]
+
+                self.computed_cwl_deps = self._parse_cwl_for_dependencies()
+
+                # Schedule ALL workflow steps to avoid DAG token deadlocks
                 for task_name, step in self.workflow.steps.items():
+                    clean_name = step.name.lstrip('/')
+
+                    if self._is_valid_cwl_step(clean_name):
+                        self._attach_step_monitors(step)
+                        _yprov_log(f"Scheduling step '{step.name}' via _run_monitored_step")
+
                     execution = asyncio.create_task(
-                        self._handle_exception(asyncio.create_task(self._monitored_step_run(step, task_name))),
+                        self._handle_exception(asyncio.create_task(self._run_monitored_step(step))),
                         name=step.name,
                     )
                     self.executions.append(execution)
@@ -414,196 +809,37 @@ if os.getenv("USE_YPROV", "").lower() == "true":
                     await asyncio.gather(*self.executions)
 
                 if self.executions:
-                    logger.info("YPROV: Synchronizing remaining background steps with a safety timeout...")
+                    _yprov_log("Synchronizing background steps...")
                     done, pending = await asyncio.wait(self.executions, timeout=3.0)
                     if pending:
-                        logger.warning(f"YPROV: {len(pending)} step tasks did not join within 3s. Proceeding with serialization.")
+                        _yprov_log(f"{len(pending)} steps did not join within timeout.", level="warning")
 
                 for step in self.workflow.steps.values():
                     if step.status in [Status.FAILED, Status.CANCELLED]:
                         raise WorkflowExecutionException("FAILED Workflow execution")
 
+                end_time_root_ns = time.time_ns()
+                self.prov_workflow._end_time = sf_utils.get_date_from_ns(end_time_root_ns)
+                self.prov_workflow._status = _get_action_status(Status.COMPLETED)
+
                 if self.workflow.persistent_id:
                     await self.workflow.context.database.update_workflow(
                         self.workflow.persistent_id,
-                        {"status": Status.COMPLETED.value, "end_time": time.time_ns()},
+                        {"status": Status.COMPLETED.value, "end_time": end_time_root_ns},
                     )
                 
-                # ======================================================================
-                # EXTRACTION BLOCK
-                # ======================================================================
-                logger.info("YPROV: Performing database extraction for exact offline parity...")
-                self.tasks_by_step_name = {}
-                wf = self.workflow
-                wf_obj = await self.workflow.context.database.get_workflow(wf.persistent_id)
-                
-                self.prov_workflow = YProvWorkflow(wf_obj["name"], f'workflow_{wf_obj["name"]}')
-                self.prov_workflow._start_time = sf_utils.get_date_from_ns(wf_obj["start_time"])
-                self.prov_workflow._end_time = sf_utils.get_date_from_ns(wf_obj["end_time"])
-                self.prov_workflow._status = self._get_action_status(Status(wf_obj["status"]))
-                self.prov_workflow._engineWMS = 'StreamFlow'
-                self.prov_workflow._level = '0'
-                
-                if "config" in self.map_file: 
-                    self.prov_workflow._resource_cwl_uri = self.map_file["config"]
+                # Final flush & package
+                json_file_path = self._flush_prov_json()
 
-                for task_name in wf.steps:
-                    clean_name = task_name.lstrip('/')
-                    if s := wf.steps.get(task_name):
-                        executions = await self.workflow.context.database.get_executions_by_step(s.persistent_id)
-                        
-                        for execution_wf in executions:
-                            task = YProvTask(str(uuid.uuid4()), clean_name)
-                            task._start_time = sf_utils.get_date_from_ns(execution_wf["start_time"])
-                            task._end_time = sf_utils.get_date_from_ns(execution_wf["end_time"])
-                            task._status = self._get_action_status(Status(execution_wf["status"]))
-                            task._level = '1'
-                            
-                            self.prov_workflow.add_task(task)
-                            
-                            if clean_name not in self.tasks_by_step_name: 
-                                self.tasks_by_step_name[clean_name] = []
-                            self.tasks_by_step_name[clean_name].append(task)
-                            
-                            if task_name != clean_name:
-                                if task_name not in self.tasks_by_step_name: 
-                                    self.tasks_by_step_name[task_name] = []
-                                self.tasks_by_step_name[task_name].append(task)
-
-                            inputs = await self.workflow.context.database.get_input_ports(s.persistent_id)
-                            for input_port in inputs:
-                                port_label = input_port["name"].split('/')[-1]
-                                label_low = port_label.lower()
-                                
-                                if ("__" in port_label or port_label.startswith("_") or "job" in label_low or 
-                                    "-injector" in label_low or "-collector" in label_low or "token" in label_low): 
-                                    continue
-                                
-                                data_id = f"ent_in_{hashlib.md5(f'{clean_name}_{port_label}'.encode()).hexdigest()[:8]}"
-                                data_in = YProvData(data_id, port_label)
-                                dt, dv, dl = self._extract_port_metadata(input_port)
-                                data_in._type, data_in._value, data_in._location = dt, dv, dl
-                                
-                                task.add_input(data_in)
-                                data_in.add_consumer(task._id)
-
-                            outputs = await self.workflow.context.database.get_output_ports(s.persistent_id)
-                            for output_port in outputs:
-                                port_label = output_port["name"].split('/')[-1]
-                                label_low = port_label.lower()
-                                
-                                if ("__" in port_label or port_label.startswith("_") or "job" in label_low or 
-                                    "-injector" in label_low or "-collector" in label_low or "token" in label_low): 
-                                    continue
-                                
-                                data_id = f"ent_out_{hashlib.md5(f'{clean_name}_{port_label}'.encode()).hexdigest()[:8]}"
-                                data_out = YProvData(data_id, port_label)
-                                dt, dv, dl = self._extract_port_metadata(output_port)
-                                data_out._type, data_out._value, data_out._location = dt, dv, dl
-                                
-                                task.add_output(data_out)
-                                data_out.set_producer(task._id)
-
-                # Compute Ahead-of-Time dependencies 
-                self.computed_cwl_deps = self._parse_cwl_for_dependencies()
-
-                os.makedirs(self.outdir, exist_ok=True)
-                json_file_path = self.prov_workflow.prov_to_json()  
-                
-                try:
-                    with open(json_file_path, 'r') as f:
-                        prov_data = json.load(f)
+                if json_file_path and os.path.exists(json_file_path):
+                    path = os.path.join(self.outdir, self.workflow.name + ".zip")
+                    with ZipFile(path, "w") as archive:
+                        archive.write(json_file_path, arcname="provenance.json")  
+                        for src, dst in self.map_file.items():
+                            if os.path.exists(src) and dst not in archive.namelist():
+                                archive.write(src, dst)
                     
-                    prov_data["wasInformedBy"] = {} 
-                    existing_relations = set()
-
-                    def _inject_edge(p_uuid: str, c_uuid: str) -> None:
-                        if p_uuid != c_uuid and (c_uuid, p_uuid) not in existing_relations:
-                            rel_key = f"_:informed_{hashlib.md5(f'{c_uuid}{p_uuid}'.encode()).hexdigest()[:8]}"
-                            prov_data["wasInformedBy"][rel_key] = {"prov:informed": c_uuid, "prov:informant": p_uuid}
-                            existing_relations.add((c_uuid, p_uuid))
-
-                    # ALIGNED COPIED LOGIC: Added nested leaf resolution 
-                    def _resolve_leaf_tasks(step_name: str) -> List[Any]:
-                        exact_match = self.tasks_by_step_name.get(step_name) or self.tasks_by_step_name.get(f"/{step_name.lstrip('/')}")
-                        if exact_match:
-                            return exact_match
-                        
-                        prefix = f"/{step_name.lstrip('/')}/"
-                        child_tasks = []
-                        for task_name, tasks in self.tasks_by_step_name.items():
-                            normalized_name = f"/{task_name.lstrip('/')}"
-                            if normalized_name.startswith(prefix):
-                                child_tasks.extend(tasks)
-                        return child_tasks
-
-                    # ALIGNED COPIED LOGIC: Loop now safely evaluates multi-tier sub-workflow paths
-                    for child_path, parent_paths in self.computed_cwl_deps.items():
-                        child_tasks = _resolve_leaf_tasks(child_path)
-                        if not child_tasks: 
-                            continue
-
-                        for parent_path in parent_paths:
-                            parent_tasks = _resolve_leaf_tasks(parent_path)
-                            if not parent_tasks: 
-                                continue
-
-                            p_len, c_len = len(parent_tasks), len(child_tasks)
-                            
-                            if p_len == 1 and c_len > 1:
-                                for c_task in child_tasks: 
-                                    _inject_edge(parent_tasks[0]._id, c_task._id)
-                            elif c_len == 1 and p_len > 1:
-                                for p_task in parent_tasks: 
-                                    _inject_edge(p_task._id, child_tasks[0]._id)
-                            elif p_len == c_len:
-                                for p_task, c_task in zip(parent_tasks, child_tasks): 
-                                    _inject_edge(p_task._id, c_task._id)
-                            else:
-                                for p_task in parent_tasks:
-                                    for c_task in child_tasks: 
-                                        _inject_edge(p_task._id, c_task._id)
-
-                    purged_ids = set()
-                    def check_spur(s: str) -> bool: 
-                        return "__" in s or "job" in s.lower() or "-injector" in s.lower() or "-collector" in s.lower() or "-token-transformer" in s.lower() or "-scatter" in s.lower() or "-condition" in s.lower()
-                    
-                    if "activity" in prov_data:
-                        for act_id, act_meta in list(prov_data["activity"].items()):
-                            if check_spur(act_meta.get("prov:label", "")) or check_spur(act_id):
-                                purged_ids.add(act_id)
-                                del prov_data["activity"][act_id]
-                                
-                    if "entity" in prov_data:
-                        for ent_id, ent_meta in list(prov_data["entity"].items()):
-                            if check_spur(ent_meta.get("prov:label", "")) or check_spur(ent_id):
-                                purged_ids.add(ent_id)
-                                del prov_data["entity"][ent_id]
-                                
-                    level_0_id = getattr(self.prov_workflow, '_id', None)
-                    if level_0_id: 
-                        purged_ids.add(level_0_id)
-                        prov_data.get("activity", {}).pop(level_0_id, None)
-                        
-                    for r_type in ["wasInformedBy", "used", "wasGeneratedBy", "wasAssociatedWith"]:
-                        if r_type in prov_data:
-                            for k in [k for k, v in prov_data[r_type].items() if any(v.get(p) in purged_ids for p in ["prov:activity", "prov:informant", "prov:informed", "prov:entity"])]:
-                                del prov_data[r_type][k]
-
-                    with open(json_file_path, 'w') as f:
-                        json.dump(prov_data, f, indent=4)
-
-                except Exception as e:
-                    logger.error(f"YPROV: Internal synchronization error occurred while creating archive: {e}")
-
-                path = os.path.join(self.outdir, self.workflow.name + ".zip")
-                with ZipFile(path, "w") as archive:
-                    archive.write(json_file_path, arcname="provenance.json")  
-                    for src, dst in self.map_file.items():
-                        if os.path.exists(src) and dst not in archive.namelist():
-                            archive.write(src, dst)
-                
-                print(f"YPROV: Successfully zipped runtime profile package entry at {path}")
+                    _yprov_log(f"Successfully generated final zip package at: {path}")
                 
                 try:
                     import concurrent.futures.process
@@ -611,7 +847,7 @@ if os.getenv("USE_YPROV", "").lower() == "true":
                 except Exception:
                     pass
 
-                logger.info("YPROV: Yielding to StreamFlow for final logging. Output tokens returned.")
+                _yprov_log("Execution finished successfully. Returning output tokens.")
                 
                 import threading
                 def delayed_exit():
@@ -623,7 +859,14 @@ if os.getenv("USE_YPROV", "").lower() == "true":
                 threading.Thread(target=delayed_exit, daemon=True).start()
                 return output_tokens
 
-            except Exception:
+            except Exception as e:
+                _yprov_log(f"Executor Execution Error: {e}\n{traceback.format_exc()}", level="error")
+                
+                if self.prov_workflow:
+                    self.prov_workflow._end_time = sf_utils.get_date_from_ns(time.time_ns())
+                    self.prov_workflow._status = _get_action_status(Status.FAILED)
+                    self._flush_prov_json()
+
                 if self.workflow.persistent_id:
                     await self.workflow.context.database.update_workflow(
                         self.workflow.persistent_id,

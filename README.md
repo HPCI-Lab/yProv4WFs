@@ -57,7 +57,14 @@ The online tracking plugin acts as a progressive execution engine. To integrate 
 Once you have copied the code into Streamflow codebase, it is possible still to decide if to use the plugin or not:
 
 - **By default**, running a workflow will use the **original scheduler**.
+    ```bash
+    streamflow run <workflow-file>
+    ```
+    or even
 
+    ```bash
+    USE_YPROV=false streamflow run <workflow-file>
+    ```
 - To **activate the online provenance** tracking on the fly, run your workflow with the `USE_YPROV` environment flag set to `true`:
     ```bash
     USE_YPROV=true streamflow run <workflow-file>
