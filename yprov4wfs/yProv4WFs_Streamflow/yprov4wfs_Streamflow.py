@@ -60,15 +60,8 @@ USE_YPROV = os.getenv("USE_YPROV", "").lower() == "true"
 
 def _yprov_log(msg: str, level: str = "info"):
     """Guaranteed unbuffered console log helper."""
-    prefix = f"[YPROV ONLINE PLUGIN] {msg}\n"
-    sys.stderr.write(prefix)
-    sys.stderr.flush()
-    if level == "error":
-        logger.error(prefix.strip())
-    elif level == "warning":
-        logger.warning(prefix.strip())
-    else:
-        logger.info(prefix.strip())
+    log_func = getattr(logger, level.lower(), logger.info)
+    log_func(f"[YPROV ONLINE PLUGIN] {msg}")
 
 def _is_system_spur(name: str) -> bool:
     """Check if a step, port, or entity is an internal StreamFlow runtime component."""
@@ -339,6 +332,9 @@ if USE_YPROV:
 
         async def _run_monitored_step(self, step: Step) -> Any:
             """Direct Coroutine Wrapper replacing monkey-patching completely."""
+            if getattr(self, "closed", False) or getattr(self, "_failure_reason", None) is not None:
+                return None
+            
             clean_name = step.name.lstrip('/')
             is_valid = self._is_valid_cwl_step(clean_name)
 
@@ -360,10 +356,14 @@ if USE_YPROV:
                         self._on_step_complete(step, start_time_ns, end_time_ns, status=Status.COMPLETED)
 
                 return result
+            
+            except asyncio.CancelledError:
+                raise
+            
             except Exception as e:
                 end_time_ns = time.time_ns()
                 if is_valid:
-                    _yprov_log(f"[STEP FAILED] Step '{clean_name}' raised an exception: {e}\n{traceback.format_exc()}", level="error")
+                    _yprov_log(f"[STEP FAILED] Step '{clean_name}' failed: {e}", level="error")
                     if clean_name not in self.job_recorded_steps:
                         self._on_step_complete(step, start_time_ns, end_time_ns, status=Status.FAILED)
                 raise
@@ -698,19 +698,38 @@ if USE_YPROV:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                logger.exception(exc)
+                if getattr(self, "_failure_reason", None) is None:
+                    self._failure_reason = exc
                 if not self.closed:
                     await self._shutdown()
 
         async def _shutdown(self):
+            if self.closed:
+                return
+            self.closed = True  # Block concurrent calls immediately
+
+            # Cancel all background task executions BEFORE tearing down connectors
+            current_task = asyncio.current_task()
+            pending_tasks = []
+            
+            if hasattr(self, "executions") and self.executions:
+                for task in self.executions:
+                    if task is not current_task and not task.done():
+                        task.cancel()
+                        pending_tasks.append(task)
+
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+            # Terminate remaining steps cleanly
             await asyncio.gather(
                 *(
                     asyncio.create_task(step.terminate(Status.CANCELLED))
                     for step in self.workflow.steps.values()
                     if not step.terminated
-                )
+                ),
+                return_exceptions=True,
             )
-            self.closed = True
 
         async def _wait_outputs(
             self, output_consumer: str, output_tokens: MutableMapping[str, Any]
@@ -816,6 +835,9 @@ if USE_YPROV:
 
                 for step in self.workflow.steps.values():
                     if step.status in [Status.FAILED, Status.CANCELLED]:
+                        reason = getattr(self, "_failure_reason", None)
+                        if reason is not None:
+                            raise WorkflowExecutionException(f"FAILED Workflow execution: {reason}") from reason
                         raise WorkflowExecutionException("FAILED Workflow execution")
 
                 end_time_root_ns = time.time_ns()
@@ -859,8 +881,35 @@ if USE_YPROV:
                 threading.Thread(target=delayed_exit, daemon=True).start()
                 return output_tokens
 
+            except WorkflowExecutionException as e:
+                reason = getattr(self, "_failure_reason", e)
+                if self.prov_workflow:
+                    self.prov_workflow._end_time = sf_utils.get_date_from_ns(time.time_ns())
+                    self.prov_workflow._status = _get_action_status(Status.FAILED)
+                    self._flush_prov_json()
+
+                if self.workflow.persistent_id:
+                    await self.workflow.context.database.update_workflow(
+                        self.workflow.persistent_id,
+                        {"status": Status.FAILED.value, "end_time": time.time_ns()},
+                    )
+                if not self.closed:
+                    await self._shutdown()
+
+                # Clean error summary banner output
+                logger.error("\n" + "=" * 62)
+                logger.error(" WORKFLOW EXECUTION FAILED")
+                logger.error(f" Reason: {reason}")
+                logger.error(" Provenance: yprov4wfs.json updated and saved successfully.")
+                logger.error("=" * 62 + "\n")
+                
+                # Flush standard I/O streams and hard-exit cleanly
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
+
             except Exception as e:
-                _yprov_log(f"Executor Execution Error: {e}\n{traceback.format_exc()}", level="error")
+                _yprov_log(f"Unexpected Executor Error: {e}", level="error")
                 
                 if self.prov_workflow:
                     self.prov_workflow._end_time = sf_utils.get_date_from_ns(time.time_ns())
@@ -874,7 +923,16 @@ if USE_YPROV:
                     )
                 if not self.closed:
                     await self._shutdown()
-                raise
+
+                logger.error("\n" + "=" * 62)
+                logger.error(" WORKFLOW EXECUTION FAILED")
+                logger.error(f" Reason: {e}")
+                logger.error(" Provenance: yprov4wfs.json updated and saved successfully.")
+                logger.error("=" * 62 + "\n")
+                
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
 
 else:
     #--------------------------------------------
