@@ -226,17 +226,37 @@ if USE_YPROV:
             self.tasks_by_step_name = {}
             self.job_recorded_steps = set()
             self.computed_cwl_deps = {}
-            self.streamflow_config_path = "streamflow.yml"
+            # Dynamically intercept the target .yml / .yaml file from the run command
+            yaml_args = [arg for arg in sys.argv if arg.endswith(('.yml', '.yaml'))]
+            self.streamflow_config_path = yaml_args[0] if yaml_args else "streamflow.yml"
+            
             self.map_file["config"] = self.streamflow_config_path
             self.outdir = "./outputs"
 
         def _is_valid_cwl_step(self, clean_name: str) -> bool:
-            """Exact whitelist match against known CWL step hierarchy."""
+            """Whitelist match against CWL hierarchy with name normalization."""
+            # Immediately drop internal StreamFlow keywords (*injector, *transformer, etc.)
+            if _is_system_spur(clean_name):
+                return False
+
+            # Fallback if CWL parsing produced no steps
             if not self.computed_cwl_deps:
                 return True
 
-            formatted = f"/{clean_name.lstrip('/')}"
-            return formatted in self.computed_cwl_deps
+            import re
+            # Strip scatter indices (_0, [0]) from each path segment
+            parts = clean_name.lstrip('/').split('/')
+            cleaned_parts = [re.sub(r'(_\d+|\[\d+\])$', '', p) for p in parts]
+            normalized_path = "/" + "/".join(cleaned_parts)
+            base_step_name = cleaned_parts[-1]
+
+            # Check if normalized path or base step matches CWL dependencies
+            for cwl_key in self.computed_cwl_deps.keys():
+                cwl_base = cwl_key.lstrip('/').split('/')[-1]
+                if cwl_key == normalized_path or cwl_base == base_step_name:
+                    return True
+
+            return False
 
         def _attach_step_monitors(self, step: Step):
             """Dynamically intercept low-level job execution to trace individual scatter steps."""
@@ -338,8 +358,8 @@ if USE_YPROV:
             clean_name = step.name.lstrip('/')
             is_valid = self._is_valid_cwl_step(clean_name)
 
-            if is_valid:
-                _yprov_log(f"[STEP START] Launching execution for step: '{clean_name}'")
+            # if is_valid:
+            #     _yprov_log(f"[STEP START] Launching execution for step: '{clean_name}'")
 
             start_time_ns = time.time_ns()
             self._attach_step_monitors(step)
@@ -350,7 +370,7 @@ if USE_YPROV:
                 
                 if is_valid:
                     duration = (end_time_ns - start_time_ns) / 1e9
-                    _yprov_log(f"[STEP COMPLETE] Step '{clean_name}' finished in {duration:.2f}s")
+                    #_yprov_log(f"[STEP COMPLETE] Step '{clean_name}' finished in {duration:.2f}s")
 
                     if clean_name not in self.job_recorded_steps:
                         self._on_step_complete(step, start_time_ns, end_time_ns, status=Status.COMPLETED)
@@ -585,7 +605,7 @@ if USE_YPROV:
                     json.dump(prov_data, f, indent=4)
 
                 file_size = os.path.getsize(json_file_path)
-                _yprov_log(f"[FLUSH SUCCESS] Updated JSON written to: {json_file_path} ({file_size} bytes)")
+                #_yprov_log(f"[FLUSH SUCCESS] Updated JSON written to: {json_file_path} ({file_size} bytes)")
 
                 return json_file_path
 
@@ -674,7 +694,7 @@ if USE_YPROV:
                         wf_file_path = wf_config.get('file')
                         if wf_file_path:
                             main_workflow_file = os.path.basename(wf_file_path)
-                            _yprov_log(f"Extracted root workflow file from streamflow.yml: {main_workflow_file}")
+                            _yprov_log(f"Extracted root workflow file from streamflow's yml: {main_workflow_file}")
                             break
                 except Exception as e:
                     _yprov_log(f"Failed reading streamflow.yml: {e}", level="warning")
@@ -779,7 +799,7 @@ if USE_YPROV:
             try:
                 output_tokens = {}
                 _yprov_log(f"Starting execution loop for Workflow ID: {self.workflow.persistent_id}")
-                _yprov_log(f"Discovered total steps in workflow object: {len(self.workflow.steps)}")
+                #_yprov_log(f"Discovered total steps in workflow object: {len(self.workflow.steps)}")
                 
                 start_time_root_ns = time.time_ns()
                 await self.workflow.context.database.update_workflow(
@@ -802,7 +822,7 @@ if USE_YPROV:
 
                     if self._is_valid_cwl_step(clean_name):
                         self._attach_step_monitors(step)
-                        _yprov_log(f"Scheduling step '{step.name}' via _run_monitored_step")
+                        #_yprov_log(f"Scheduling step '{step.name}' via _run_monitored_step")
 
                     execution = asyncio.create_task(
                         self._handle_exception(asyncio.create_task(self._run_monitored_step(step))),
@@ -828,7 +848,7 @@ if USE_YPROV:
                     await asyncio.gather(*self.executions)
 
                 if self.executions:
-                    _yprov_log("Synchronizing background steps...")
+                    #_yprov_log("Synchronizing background steps...")
                     done, pending = await asyncio.wait(self.executions, timeout=3.0)
                     if pending:
                         _yprov_log(f"{len(pending)} steps did not join within timeout.", level="warning")
@@ -933,6 +953,29 @@ if USE_YPROV:
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(1)
+
+
+        async def close(self) -> None:
+            if self._closed:
+                return
+            if self._closing is not None:
+                await self._closing.wait()
+            else:
+                # Terminate all steps
+                await asyncio.gather(
+                    *(
+                        asyncio.create_task(step.terminate(Status.CANCELLED))
+                        for step in self.workflow.steps.values()
+                        if not step.terminated
+                    )
+                )
+                # Mark the executor as closed
+                self._closed = True
+
+        async def closed(self) -> bool:
+            if self._closing is not None:
+                await self._closing.wait()
+            return self._closed
 
 else:
     #--------------------------------------------
@@ -1073,3 +1116,25 @@ else:
                 if not self.closed:
                     await self._shutdown()
                 raise
+            
+        async def close(self) -> None:
+            if self._closed:
+                return
+            if self._closing is not None:
+                await self._closing.wait()
+            else:
+                # Terminate all steps
+                await asyncio.gather(
+                    *(
+                        asyncio.create_task(step.terminate(Status.CANCELLED))
+                        for step in self.workflow.steps.values()
+                        if not step.terminated
+                    )
+                )
+                # Mark the executor as closed
+                self._closed = True
+
+        async def closed(self) -> bool:
+            if self._closing is not None:
+                await self._closing.wait()
+            return self._closed
