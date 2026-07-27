@@ -217,6 +217,8 @@ if USE_YPROV:
             self.executions: MutableSequence[asyncio.Task] = []
             self.output_tasks: MutableMapping[str, asyncio.Task] = {}
             self.received: MutableSequence[str] = []
+            self._closed: bool = False
+            self._closing: asyncio.Event | None = None
             self.closed: bool = False
 
             _yprov_log("StreamFlowExecutor instance created successfully.")
@@ -987,6 +989,8 @@ else:
             self.executions: MutableSequence[asyncio.Task] = []
             self.output_tasks: MutableMapping[str, asyncio.Task] = {}
             self.received: MutableSequence[str] = []
+            self._closed: bool = False
+            self._closing: asyncio.Event | None = None
             self.closed: bool = False
 
         async def _handle_exception(self, task: asyncio.Task):
