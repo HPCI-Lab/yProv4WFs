@@ -16,6 +16,14 @@ If you want to run the PLUGIN version:
 - Run USE_YPROV=true streamflow run
 
 The default behavior is the usage of the original version.
+
+In addition, the runtime version allows the user to change two parameters
+for the "batching writing":
+- _FLUSH_BATCH_SIZE, how many tasks need to be completed before flushing
+- _FLUSH_MIN_INTERVAL_S, how many seconds need to pass before flushing
+
+Based on the workflow characteristics, it is possible to find a better set of
+parameters (the one proposed should already give a good performance).
 """
 
 from __future__ import annotations
@@ -57,6 +65,18 @@ logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 
 # Environment trigger check
 USE_YPROV = os.getenv("USE_YPROV", "").lower() == "true"
+
+# Intermediate provenance writes are batched instead of happening after every
+# single task. Each write re-serializes and re-purges the WHOLE graph, so
+# writing once per task costs O(T^2) total for a T-task workflow. Flushing
+# every _FLUSH_BATCH_SIZE tasks (or _FLUSH_MIN_INTERVAL_S seconds, whichever
+# comes first) keeps the on-disk file bounded-freshness "online" while
+# cutting total flush cost by roughly the batch size.
+
+_FLUSH_BATCH_SIZE = 25 # tasks
+_FLUSH_MIN_INTERVAL_S = 5.0 * 60.0 # minutes
+
+# -------------------------------------------------------
 
 def _yprov_log(msg: str, level: str = "info"):
     """Guaranteed unbuffered console log helper."""
@@ -235,8 +255,35 @@ if USE_YPROV:
             self.map_file["config"] = self.streamflow_config_path
             self.outdir = "./outputs"
 
+            # Memoizes _is_valid_cwl_step() per step name -- see that method.
+            self._activity_validity_cache: MutableMapping[str, bool] = {}
+
+            # Batches intermediate writes instead of flushing after every
+            # single task -- see _maybe_flush() for the reasoning. Fixed
+            # constants, not env-configurable: USE_YPROV is the only knob.
+            self._flush_batch_size = _FLUSH_BATCH_SIZE
+            self._flush_min_interval_s = _FLUSH_MIN_INTERVAL_S
+            self._pending_since_flush = 0
+            self._last_flush_ts = 0.0
+
         def _is_valid_cwl_step(self, clean_name: str) -> bool:
-            """Whitelist match against CWL hierarchy with name normalization."""
+            """
+            Whitelist match against CWL hierarchy with name normalization.
+
+            Memoized by clean_name: this gets called once per activity on
+            every flush (so hundreds of times for a heavily-scattered step),
+            but a given step name's validity never changes once decided, so
+            re-running the regex/normalization work every time is pure waste.
+            """
+            cached = self._activity_validity_cache.get(clean_name)
+            if cached is not None:
+                return cached
+
+            result = self._compute_is_valid_cwl_step(clean_name)
+            self._activity_validity_cache[clean_name] = result
+            return result
+
+        def _compute_is_valid_cwl_step(self, clean_name: str) -> bool:
             # Immediately drop internal StreamFlow keywords (*injector, *transformer, etc.)
             if _is_system_spur(clean_name):
                 return False
@@ -443,8 +490,35 @@ if USE_YPROV:
             if clean_name not in self.tasks_by_step_name:
                 self.tasks_by_step_name[clean_name] = []
             self.tasks_by_step_name[clean_name].append(task)
-            
-            self._flush_prov_json()
+
+            self._pending_since_flush += 1
+            self._maybe_flush()
+
+        def _maybe_flush(self) -> Optional[str]:
+            """
+            Writes an intermediate snapshot after every _FLUSH_BATCH_SIZE
+            captured tasks, or after _FLUSH_MIN_INTERVAL_S seconds since the
+            last flush, whichever comes first. Each flush re-serializes and
+            re-purges the WHOLE graph, so writing once per task would cost
+            O(T^2) total for a T-task workflow; batching cuts that by roughly
+            the batch size while keeping the on-disk file's staleness bounded.
+
+            run()'s own end-of-workflow and failure-path calls to
+            _flush_prov_json() are unconditional and untouched by this --
+            the FINAL file is always complete regardless of batch timing.
+            """
+            now = time.time()
+            should_flush = (
+                self._pending_since_flush >= self._flush_batch_size
+                or (now - self._last_flush_ts) >= self._flush_min_interval_s
+            )
+            if not should_flush:
+                return None
+
+            result = self._flush_prov_json()
+            self._pending_since_flush = 0
+            self._last_flush_ts = time.time()
+            return result
 
         def _flush_prov_json(self) -> Optional[str]:
             try:
@@ -460,13 +534,13 @@ if USE_YPROV:
                 # -----------------------------------------------------------
                 # STRICT WHITELIST & ENTITY FILTERING
                 # -----------------------------------------------------------
-                allowed_cwl_keys = set(self.computed_cwl_deps.keys()) if self.computed_cwl_deps else set()
-
                 def is_valid_cwl_activity(label: str) -> bool:
-                    if not allowed_cwl_keys:
-                        return True
-                    formatted = f"/{label.lstrip('/')}"
-                    return formatted in allowed_cwl_keys
+                    # Delegate to the single shared, memoized check used at
+                    # attach-time -- previously this was its own exact-match-only
+                    # copy, which could silently disagree with _is_valid_cwl_step
+                    # about whether a normalized/scatter-index-stripped name
+                    # counts as "required."
+                    return self._is_valid_cwl_step(label)
 
                 def _get_prov_id(val: Any) -> Optional[str]:
                     if isinstance(val, str):

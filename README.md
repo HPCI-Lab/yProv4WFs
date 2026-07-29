@@ -69,3 +69,18 @@ Once you have copied the code into Streamflow codebase, it is possible still to 
     ```bash
     USE_YPROV=true streamflow run <workflow-file>
     ```
+
+#### Batch configuration
+The runtime version includes a batch strategy in order to reduce the overhead of IO operations.
+Within the `yprov4wfs_Streamflow.py` file, you can find two parameters:
+
+```python
+_FLUSH_BATCH_SIZE = 25 # tasks
+_FLUSH_MIN_INTERVAL_S = 5.0 * 60.0 # minutes
+```
+
+These are the default values but can be changed based on the requirements.
+
+- **_FLUSH_BATCH_SIZE**: the number of tasks to be completed before executing a flush.
+
+- **_FLUSH_MIN_INTERVAL_S**: the number of seconds that need to elapse before executing a flush unless the _FLUSH_BATCH_SIZE has been reached.
