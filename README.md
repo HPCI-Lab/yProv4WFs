@@ -75,7 +75,7 @@ The runtime version includes a batch strategy in order to reduce the overhead of
 Within the `yprov4wfs_Streamflow.py` file, you can find two parameters:
 
 ```python
-_FLUSH_BATCH_SIZE = 25 # tasks
+_FLUSH_BATCH_SIZE = 10 # tasks
 _FLUSH_MIN_INTERVAL_S = 5.0 * 60.0 # minutes
 ```
 

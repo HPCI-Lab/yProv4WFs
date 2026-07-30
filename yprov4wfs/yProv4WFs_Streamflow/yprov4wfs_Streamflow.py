@@ -29,6 +29,7 @@ parameters (the one proposed should already give a good performance).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 import os
 import sys
@@ -73,7 +74,7 @@ USE_YPROV = os.getenv("USE_YPROV", "").lower() == "true"
 # comes first) keeps the on-disk file bounded-freshness "online" while
 # cutting total flush cost by roughly the batch size.
 
-_FLUSH_BATCH_SIZE = 25 # tasks
+_FLUSH_BATCH_SIZE = 10 # tasks
 _FLUSH_MIN_INTERVAL_S = 5.0 * 60.0 # minutes
 
 # -------------------------------------------------------
@@ -255,16 +256,22 @@ if USE_YPROV:
             self.map_file["config"] = self.streamflow_config_path
             self.outdir = "./outputs"
 
-            # Memoizes _is_valid_cwl_step() per step name -- see that method.
+            # Memoizes _is_valid_cwl_step() per step name
             self._activity_validity_cache: MutableMapping[str, bool] = {}
 
             # Batches intermediate writes instead of flushing after every
-            # single task -- see _maybe_flush() for the reasoning. Fixed
+            # single task, see _maybe_flush() for the reasoning. Fixed
             # constants, not env-configurable: USE_YPROV is the only knob.
             self._flush_batch_size = _FLUSH_BATCH_SIZE
             self._flush_min_interval_s = _FLUSH_MIN_INTERVAL_S
             self._pending_since_flush = 0
             self._last_flush_ts = 0.0
+
+            # Serializes all writes to yprov4wfs.json and coalesces bursty
+            # flush requests, see _flush_prov_json_async() / _maybe_flush().
+            self._flush_lock = asyncio.Lock()
+            self._flush_task: Optional[asyncio.Task] = None
+            self._flush_again = False
 
         def _is_valid_cwl_step(self, clean_name: str) -> bool:
             """
@@ -326,7 +333,7 @@ if USE_YPROV:
                 if hasattr(step, method_name):
                     orig_method = getattr(step, method_name)
                     if callable(orig_method) and not getattr(orig_method, '_is_yprov_hook', False):
-                        if asyncio.iscoroutinefunction(orig_method):
+                        if inspect.iscoroutinefunction(orig_method):
                             async def wrapper(*args, **kwargs):
                                 start_ns = time.time_ns()
                                 try:
@@ -494,18 +501,35 @@ if USE_YPROV:
             self._pending_since_flush += 1
             self._maybe_flush()
 
-        def _maybe_flush(self) -> Optional[str]:
+        def _maybe_flush(self) -> None:
             """
             Writes an intermediate snapshot after every _FLUSH_BATCH_SIZE
             captured tasks, or after _FLUSH_MIN_INTERVAL_S seconds since the
             last flush, whichever comes first. Each flush re-serializes and
             re-purges the WHOLE graph, so writing once per task would cost
             O(T^2) total for a T-task workflow; batching cuts that by roughly
-            the batch size while keeping the on-disk file's staleness bounded.
+            the batch size.
 
-            run()'s own end-of-workflow and failure-path calls to
-            _flush_prov_json() are unconditional and untouched by this --
-            the FINAL file is always complete regardless of batch timing.
+            Schedules _flush_prov_json_async() as a background task via
+            asyncio.create_task() rather than blocking whatever just captured 
+            a task while the write happens. This is called from both async
+            (_on_job_complete's coroutine wrapper) and plain-sync
+            (_attach_step_monitors' sync wrapper branch) call sites, so it
+            can't safely `await` here itself; create_task() only needs a
+            running event loop, not an async caller.
+
+            At most one flush task is ever in flight at a time: if one is
+            already running when a new batch fills, this just marks that
+            another pass is needed (_flush_again) instead of spawning a
+            second independent task, avoiding both a backlog of redundant
+            writes and any chance of two writes to the same file completing
+            out of order.
+
+            run()'s own end-of-workflow and failure-path calls await
+            _flush_prov_json_async() directly instead of going through this
+            method, the FINAL file write is always waited-on to completion,
+            never a fire-and-forget task that could get cut off by the
+            process exiting.
             """
             now = time.time()
             should_flush = (
@@ -515,31 +539,61 @@ if USE_YPROV:
             if not should_flush:
                 return None
 
-            result = self._flush_prov_json()
             self._pending_since_flush = 0
             self._last_flush_ts = time.time()
+
+            if self._flush_task is not None and not self._flush_task.done():
+                self._flush_again = True
+                return None
+
+            try:
+                self._flush_task = asyncio.create_task(self._run_flush_with_coalescing())
+            except RuntimeError:
+                self._flush_prov_json()
+
+        async def _run_flush_with_coalescing(self) -> Optional[str]:
+            """
+            Runs one flush, then, if more tasks were captured while it was
+            running, runs exactly one more, instead of letting a backlog of
+            redundant flush tasks pile up. _flush_prov_json_async() itself
+            still serializes against any OTHER in-flight flush via
+            self._flush_lock: this method keeps the number of scheduled
+            flush tasks at any moment to at most one, and the lock guarantees 
+            that even if two ever coexisted, their writes could never complete 
+            out of order.
+            """
+            result = await self._flush_prov_json_async()
+            if self._flush_again:
+                self._flush_again = False
+                result = await self._flush_prov_json_async()
             return result
 
-        def _flush_prov_json(self) -> Optional[str]:
+        def _compute_flush_payload(self) -> Optional[Tuple[str, MutableMapping[str, Any]]]:
+            """
+            Builds the purged/edge-injected provenance dict entirely in memory
+            and returns (target_path, prov_data) WITHOUT touching disk.
+
+            Uses to_prov() (the library's in-memory JSON-string builder)
+            instead of prov_to_json() (which does its own blocking write to
+            disk that we'd immediately overwrite anyway). That removes one
+            full write + one full re-read per flush.
+            """
             try:
                 os.makedirs(self.outdir, exist_ok=True)
-                json_file_path = self.prov_workflow.prov_to_json()  
-                if not json_file_path or not os.path.exists(json_file_path):
-                    _yprov_log("yprov4wfs prov_to_json() returned empty path.", level="error")
+                prov_json_str = self.prov_workflow.to_prov()
+                if not prov_json_str:
+                    _yprov_log("yprov4wfs to_prov() returned no data.", level="error")
                     return None
 
-                with open(json_file_path, 'r') as f:
-                    prov_data = json.load(f)
+                json_file_path = 'yprov4wfs.json'
+                prov_data = json.loads(prov_json_str)
 
                 # -----------------------------------------------------------
                 # STRICT WHITELIST & ENTITY FILTERING
                 # -----------------------------------------------------------
                 def is_valid_cwl_activity(label: str) -> bool:
                     # Delegate to the single shared, memoized check used at
-                    # attach-time -- previously this was its own exact-match-only
-                    # copy, which could silently disagree with _is_valid_cwl_step
-                    # about whether a normalized/scatter-index-stripped name
-                    # counts as "required."
+                    # attach-time
                     return self._is_valid_cwl_step(label)
 
                 def _get_prov_id(val: Any) -> Optional[str]:
@@ -676,17 +730,73 @@ if USE_YPROV:
                             for p_task in parent_tasks:
                                 for c_task in child_tasks: _inject_edge(p_task._id, c_task._id)
 
-                # Write cleaned JSON back to disk
-                with open(json_file_path, 'w') as f:
-                    json.dump(prov_data, f, indent=4)
-
-                file_size = os.path.getsize(json_file_path)
-                #_yprov_log(f"[FLUSH SUCCESS] Updated JSON written to: {json_file_path} ({file_size} bytes)")
-
-                return json_file_path
+                return json_file_path, prov_data
 
             except Exception as e:
-                _yprov_log(f"JSON Flush Error: {e}\n{traceback.format_exc()}", level="error")
+                _yprov_log(f"JSON Flush Error (compute phase): {e}\n{traceback.format_exc()}", level="error")
+                return None
+
+        @staticmethod
+        def _write_json_file_sync(json_file_path: str, prov_data: MutableMapping[str, Any]) -> int:
+            """
+            The actual blocking disk write, run off the event loop thread via
+            asyncio.to_thread() (see _flush_prov_json_async). Kept as a plain
+            @staticmethod rather than inline code so asyncio.to_thread has a
+            single, simple, picklable-argument callable to dispatch.
+            """
+            with open(json_file_path, 'w') as f:
+                json.dump(prov_data, f, indent=4)
+            return os.path.getsize(json_file_path)
+
+        async def _flush_prov_json_async(self) -> Optional[str]:
+            """
+            Computes the purged/edge-injected snapshot, then performs the 
+            actual disk write via asyncio.to_thread() so the write itself 
+            doesn't block the event loop while StreamFlow is scheduling 
+            other steps.
+
+            Wrapped in self._flush_lock so that even if this ever gets
+            invoked from more than one place concurrently, the compute-then-
+            write sequence is atomic end-to-end: payload computation happens
+            AFTER acquiring the lock, so a flush that had to wait picks up
+            the freshest state rather than a stale snapshot, and writes can
+            never land on disk out of order. Without this, multiple
+            fire-and-forget flush tasks dispatched via asyncio.to_thread's
+            thread pool could have their writes to the SAME file complete out
+            of order; an older, smaller snapshot finishing AFTER a newer,
+            more complete one, silently clobbering it with less data even
+            though nothing was actually lost from self.prov_workflow itself.
+            """
+            async with self._flush_lock:
+                payload = self._compute_flush_payload()
+                if payload is None:
+                    return None
+                json_file_path, prov_data = payload
+
+                try:
+                    file_size = await asyncio.to_thread(self._write_json_file_sync, json_file_path, prov_data)
+                    #_yprov_log(f"[FLUSH SUCCESS] Updated JSON written to: {json_file_path} ({file_size} bytes)")
+                    return json_file_path
+                except Exception as e:
+                    _yprov_log(f"JSON Flush Error (write phase): {e}\n{traceback.format_exc()}", level="error")
+                    return None
+
+        def _flush_prov_json(self) -> Optional[str]:
+            """
+            Synchronous convenience wrapper, computes the payload and writes
+            it immediately, blocking. Used only as a fallback if no event
+            loop is reachable from the calling context; the async path above
+            is preferred everywhere else.
+            """
+            payload = self._compute_flush_payload()
+            if payload is None:
+                return None
+            json_file_path, prov_data = payload
+            try:
+                self._write_json_file_sync(json_file_path, prov_data)
+                return json_file_path
+            except Exception as e:
+                _yprov_log(f"JSON Flush Error (write phase): {e}\n{traceback.format_exc()}", level="error")
                 return None
 
         def _parse_cwl_for_dependencies(self) -> MutableMapping[str, List[str]]:
@@ -947,7 +1057,7 @@ if USE_YPROV:
                     )
                 
                 # Final flush & package
-                json_file_path = self._flush_prov_json()
+                json_file_path = await self._flush_prov_json_async()
 
                 if json_file_path and os.path.exists(json_file_path):
                     path = os.path.join(self.outdir, self.workflow.name + ".zip")
@@ -982,7 +1092,7 @@ if USE_YPROV:
                 if self.prov_workflow:
                     self.prov_workflow._end_time = sf_utils.get_date_from_ns(time.time_ns())
                     self.prov_workflow._status = _get_action_status(Status.FAILED)
-                    self._flush_prov_json()
+                    await self._flush_prov_json_async()
 
                 if self.workflow.persistent_id:
                     await self.workflow.context.database.update_workflow(
@@ -1010,7 +1120,7 @@ if USE_YPROV:
                 if self.prov_workflow:
                     self.prov_workflow._end_time = sf_utils.get_date_from_ns(time.time_ns())
                     self.prov_workflow._status = _get_action_status(Status.FAILED)
-                    self._flush_prov_json()
+                    await self._flush_prov_json_async()
 
                 if self.workflow.persistent_id:
                     await self.workflow.context.database.update_workflow(
