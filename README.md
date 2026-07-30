@@ -54,13 +54,13 @@ streamflow prov <workflow-file>
 ### Online version
 The online tracking plugin acts as a progressive execution engine. To integrate it, replace the contents of StreamFlow's core scheduler file `streamflow/workflow/executor.py` with the code of `yprov4wfs_Streamflow.py`.
 
-Once you have copied the code into Streamflow codebase, it is possible still to decide if to use the plugin or not:
+Once you have copied the code into the StreamFlow codebase, it is still possible to decide whether to use the plugin or not:
 
-- **By default**, running a workflow will use the **original scheduler**.
+- **By default**, running a workflow will use the **original scheduler**:
     ```bash
     streamflow run <workflow-file>
     ```
-    or even
+    or explicitly:
 
     ```bash
     USE_YPROV=false streamflow run <workflow-file>
@@ -70,17 +70,13 @@ Once you have copied the code into Streamflow codebase, it is possible still to 
     USE_YPROV=true streamflow run <workflow-file>
     ```
 
-#### Batch configuration
-The runtime version includes a batch strategy in order to reduce the overhead of IO operations.
-Within the `yprov4wfs_Streamflow.py` file, you can find two parameters:
+#### Batch Configuration
+The runtime version includes a batching strategy to reduce the overhead.
 
-```python
-_FLUSH_BATCH_SIZE = 10 # tasks
-_FLUSH_MIN_INTERVAL_S = 5.0 * 60.0 # minutes
-```
+- **`BATCH_SIZE`:** You can dynamically set the batch size when starting your workflow using the `BATCH_SIZE` flag (defaults to `10` if unset or invalid):
+    ```bash
+    USE_YPROV=true BATCH_SIZE=20 streamflow run <workflow-file>
+    ```
 
-These are the default values but can be changed based on the requirements.
-
-- **_FLUSH_BATCH_SIZE**: the number of tasks to be completed before executing a flush.
-
-- **_FLUSH_MIN_INTERVAL_S**: the number of seconds that need to elapse before executing a flush unless the _FLUSH_BATCH_SIZE has been reached.
+- **`_FLUSH_MIN_INTERVAL_S` (codebase configuration):**
+  Internal flush parameter can be adjusted directly within the source code of `yprov4wfs_Streamflow.py` if needed.

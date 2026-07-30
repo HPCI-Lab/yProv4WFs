@@ -17,10 +17,19 @@ If you want to run the PLUGIN version:
 
 The default behavior is the usage of the original version.
 
-In addition, the runtime version allows the user to change two parameters
-for the "batching writing":
-- _FLUSH_BATCH_SIZE, how many tasks need to be completed before flushing
-- _FLUSH_MIN_INTERVAL_S, how many seconds need to pass before flushing
+In addition, the runtime version allows the user to configure execution and 
+batch writing parameters via environment variables:
+
+Execution settings:
+- BATCH_SIZE: Set the execution batch size as a positive integer (e.g., BATCH_SIZE=20). 
+  Defaults to 10 if unset, invalid, or <= 0.
+
+Batch writing settings:
+- _FLUSH_BATCH_SIZE: How many tasks need to be completed before flushing.
+- _FLUSH_MIN_INTERVAL_S: How many seconds need to pass before flushing (modifiable directly in the source code).
+
+Example usage with custom flags:
+- USE_YPROV=true BATCH_SIZE=25 streamflow run
 
 Based on the workflow characteristics, it is possible to find a better set of
 parameters (the one proposed should already give a good performance).
@@ -74,7 +83,14 @@ USE_YPROV = os.getenv("USE_YPROV", "").lower() == "true"
 # comes first) keeps the on-disk file bounded-freshness "online" while
 # cutting total flush cost by roughly the batch size.
 
-_FLUSH_BATCH_SIZE = 10 # tasks
+# Batch size check
+try:
+    _FLUSH_BATCH_SIZE = int(os.getenv("BATCH_SIZE", 10)) # tasks
+    if _FLUSH_BATCH_SIZE <= 0: # Negative values are NOT valid, fallback value
+        _FLUSH_BATCH_SIZE = 10
+except ValueError:
+    _FLUSH_BATCH_SIZE = 10  # Fallback if BATCH_SIZE is set to non-numeric text
+
 _FLUSH_MIN_INTERVAL_S = 5.0 * 60.0 # minutes
 
 # -------------------------------------------------------
@@ -130,6 +146,7 @@ def _generate_entity_id(step_name: str, port_label: str, p_type: str, p_val: str
 
 if USE_YPROV:
     _yprov_log("USE_YPROV=true: INITIALIZING STREAMFLOW EXECUTOR")
+    _yprov_log(f"BATCH SIZE set to {_FLUSH_BATCH_SIZE}")
 
     #--------------------------------------------
     # CWL DEPENDENCY PARSING HELPERS
