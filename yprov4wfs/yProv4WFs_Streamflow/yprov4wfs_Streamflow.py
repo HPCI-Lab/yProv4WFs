@@ -786,17 +786,25 @@ if USE_YPROV:
             though nothing was actually lost from self.prov_workflow itself.
             """
             async with self._flush_lock:
+                t_payload = time.perf_counter()
                 payload = self._compute_flush_payload()
                 if payload is None:
                     return None
                 json_file_path, prov_data = payload
+                payload_dur = time.perf_counter() - t_payload
 
                 try:
+                    flush_start_ts = time.perf_counter()
                     file_size = await asyncio.to_thread(self._write_json_file_sync, json_file_path, prov_data)
+                    flush_duration_s = time.perf_counter() - flush_start_ts
+                    
                     _yprov_log(f"[PROV_FLUSH] activities={len(prov_data.get('activity', {}))} "
                             f"entities={len(prov_data.get('entity', {}))} "
                             f"wasInformedBy={len(prov_data.get('wasInformedBy', {}))} "
-                            f"file_size_bytes={file_size}")
+                            f"file_size_bytes={file_size} "
+                            f"payload_build_s={payload_dur:.4f} "
+                            f"flush_write_s={flush_duration_s:.4f}")
+
                     self._total_flush_count += 1 # increment number of flushes
 
                     return json_file_path
@@ -1023,7 +1031,9 @@ if USE_YPROV:
                 if "config" in self.map_file: 
                     self.prov_workflow._resource_cwl_uri = self.map_file["config"]
 
+                t_cwl = time.perf_counter()
                 self.computed_cwl_deps = self._parse_cwl_for_dependencies()
+                _yprov_log(f"YPROV [PARSER]: CWL graph parsing completed in {time.perf_counter() - t_cwl:.4f}s")
 
                 # Schedule ALL workflow steps to avoid DAG token deadlocks
                 for task_name, step in self.workflow.steps.items():
@@ -1084,13 +1094,16 @@ if USE_YPROV:
 
                 if json_file_path and os.path.exists(json_file_path):
                     path = os.path.join(self.outdir, self.workflow.name + ".zip")
+
+                    t_zip = time.perf_counter()
                     with ZipFile(path, "w") as archive:
                         archive.write(json_file_path, arcname="provenance.json")  
                         for src, dst in self.map_file.items():
                             if os.path.exists(src) and dst not in archive.namelist():
                                 archive.write(src, dst)
                     
-                    _yprov_log(f"Successfully generated final zip package at: {path}")
+                    zip_dur = time.perf_counter() - t_zip
+                    _yprov_log(f"Successfully generated final zip package in {zip_dur:.4f}s at: {path}")
                 
                 try:
                     import concurrent.futures.process

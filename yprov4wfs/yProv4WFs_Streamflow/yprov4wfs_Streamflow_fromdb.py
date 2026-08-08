@@ -7,7 +7,7 @@ Moreover, it includes:
 - Handling multi-tier nested workflows for dependency solving.
 
 The CWL entry point is resolved directly from the workflow's own DB record
-(workflow.params.config.file) rather than from a streamflow.yml on disk,
+(workflow.params.config.file) rather than from a streamflow.yml on disk --
 offline extraction is only ever given a workflow ID/name, and may run from a
 different directory or long after the original submission, so a hardcoded
 streamflow.yml path was never reliable here.
@@ -17,6 +17,7 @@ import os
 import uuid
 import json
 import yaml
+import time
 import logging
 import hashlib
 from abc import abstractmethod
@@ -43,7 +44,7 @@ def _crawl_cwl_dependencies(main_cwl_path: str) -> list[str]:
     """
     Recursively crawls a KNOWN CWL entry-point file for every 'run: ...cwl'
     reference it (transitively) contains. Doesn't care how main_cwl_path was
-    determined, that's the job of the two resolver functions below.
+    determined -- that's the job of the two resolver functions below.
     """
     if not main_cwl_path or not os.path.exists(main_cwl_path):
         logger.warning(f"YPROV [DISCOVERY]: Unable to locate primary CWL file at: {main_cwl_path}")
@@ -111,7 +112,7 @@ def _resolve_main_cwl_from_db_params(raw_params: Any, base_dir: str) -> Optional
     SPECIFIC execution actually used, persisted at submission time
     regardless of what's on disk now.
 
-    base_dir anchors the relative path from params (e.g. "./main.cwl")
+    base_dir anchors the relative path from params (e.g. "./main.cwl") --
     there's no absolute base directory recorded in params itself, so this is
     always the current working directory at the time extraction is run.
     """
@@ -331,6 +332,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         Applies granular execution tracking for scatter nodes while 
         deduplicating their shared array entities.
         """
+        t0 = time.perf_counter()
         logger.info("YPROV [DB_EXTRACT]: Beginning provenance extraction from database...")
         self.tasks_by_step_name = {}
         
@@ -425,10 +427,13 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                             task.add_output(data_out)
                             data_out.set_producer(task._id)
 
-            logger.info(f"YPROV [DB_EXTRACT]: Successfully parsed {task_count} task execution records from DB.")
+            logger.info(f"YPROV [DB_EXTRACT]: Parsed {task_count} tasks in {time.perf_counter() - t0:.4f}s")
+            t_cwl = time.perf_counter()
 
             # Resolve structural dependencies
             self.computed_cwl_deps = self._parse_cwl_for_dependencies()
+            logger.info(f"YPROV [PARSER]: CWL graph parsing completed in {time.perf_counter() - t_cwl:.4f}s")
+
             return self.prov_workflow
 
     async def create_archive(self, outdir: str, filename: Optional[str], config: Optional[str], additional_files: Optional[MutableSequence[MutableMapping[str, str]]], additional_properties: Optional[MutableSequence[MutableMapping[str, str]]]):
@@ -436,6 +441,8 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         Generates the PROV-JSON representation, performs structural edge reconciliation, 
         and packages the results into a ZIP archive.
         """
+        t_total_start = time.perf_counter()
+
         if config is not None: 
             self.map_file["config"] = config
             
@@ -443,7 +450,8 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         os.makedirs(outdir, exist_ok=True)
         path = os.path.join(outdir, filename or (self.workflows[0].name + ".zip"))
         json_file_path = self.prov_workflow.prov_to_json()  
-        
+
+        t_reconcile = time.perf_counter()
         try:
             logger.info("YPROV [ARCHIVE]: Reconciling graph edges into PROV-JSON schema...")
             with open(json_file_path, 'r') as f: 
@@ -531,10 +539,12 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
             # Log provenance json file size metrics
             json_bytes = os.path.getsize(json_file_path)
             logger.info(f"YPROV [ARCHIVE]: [PROV_FILE_SIZE] provenance.json = {json_bytes} Bytes")
+            logger.info(f"YPROV [ARCHIVE]: Edge reconciliation & PROV-JSON write completed in {time.perf_counter() - t_reconcile:.4f}s")
 
         except Exception as e:
             logger.error(f"YPROV [ARCHIVE]: Internal sync failure during JSON edge cleanup: {e}")
 
+        t_zip = time.perf_counter()
         with ZipFile(path, "w") as archive:
             archive.write(json_file_path, arcname="provenance.json")  
             for src, dst in self.map_file.items():
@@ -542,5 +552,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                     archive.write(src, dst)
 
         zip_bytes = os.path.getsize(path)
+        logger.info(f"YPROV [ARCHIVE]: Archive compression completed in {time.perf_counter() - t_zip:.4f}s")
         logger.info(f"YPROV [ARCHIVE]: [PROV_ARCHIVE_SIZE] {os.path.basename(path)} = {zip_bytes} Bytes")
+        logger.info(f"YPROV [ARCHIVE]: [TOTAL_OFFLINE_TIME] total_duration_s={time.perf_counter() - t_total_start:.4f}s")
         logger.info(f"YPROV [ARCHIVE]: Successfully generated offline yProv4WFs archive at {path}")
