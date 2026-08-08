@@ -5,6 +5,12 @@ after execution has finished.
 Moreover, it includes:
 - CWL crawler for finding all cwl files involved
 - Handling multi-tier nested workflows for dependency solving.
+
+The CWL entry point is resolved directly from the workflow's own DB record
+(workflow.params.config.file) rather than from a streamflow.yml on disk,
+offline extraction is only ever given a workflow ID/name, and may run from a
+different directory or long after the original submission, so a hardcoded
+streamflow.yml path was never reliable here.
 """
 
 import os
@@ -32,37 +38,20 @@ from yprov4wfs.datamodel.data import Data
 # Silence aiosqlite background logging
 logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 
-def discover_workflow_cwl_files(streamflow_config_path: Optional[str]) -> list[str]:
-    """
-    Parses the primary streamflow.yml deployment config file to isolate the entrypoint,
-    and safely traverses the YAML structure to recursively find all external CWL files.
-    """
-    main_cwl = None
-    if streamflow_config_path and os.path.exists(streamflow_config_path):
-        try:
-            # Resolve symbolic links on the configuration directory right away
-            real_config_path = os.path.abspath(os.path.realpath(streamflow_config_path))
-            with open(real_config_path, 'r') as sf_file:
-                sf_data = yaml.safe_load(sf_file)
-            
-            workflows = sf_data.get("workflows", {})
-            if workflows and isinstance(workflows, dict):
-                first_workflow_name = next(iter(workflows))
-                workflow_data = workflows.get(first_workflow_name, {})
-                main_cwl_relative = workflow_data.get("config", {}).get("file")
-                
-                if main_cwl_relative:
-                    config_dir = os.path.dirname(real_config_path)
-                    main_cwl = os.path.abspath(os.path.realpath(os.path.join(config_dir, main_cwl_relative)))
-        except Exception as e:
-            logger.warning(f"YPROV: Error parsing streamflow.yml ({streamflow_config_path}): {e}")
 
-    if not main_cwl or not os.path.exists(main_cwl):
-        logger.warning(f"YPROV: Unable to determine a valid primary CWL file. Resolved: {main_cwl}")
+def _crawl_cwl_dependencies(main_cwl_path: str) -> list[str]:
+    """
+    Recursively crawls a KNOWN CWL entry-point file for every 'run: ...cwl'
+    reference it (transitively) contains. Doesn't care how main_cwl_path was
+    determined, that's the job of the two resolver functions below.
+    """
+    if not main_cwl_path or not os.path.exists(main_cwl_path):
+        logger.warning(f"YPROV [DISCOVERY]: Unable to locate primary CWL file at: {main_cwl_path}")
         return []
 
-    # Recursively parse YAML to find all 'run: ...cwl' paths
-    to_parse = [os.path.realpath(main_cwl)]
+    logger.info(f"YPROV [DISCOVERY]: Starting CWL discovery crawl from entrypoint: {main_cwl_path}")
+
+    to_parse = [os.path.realpath(main_cwl_path)]
     discovered_files = set(to_parse)
 
     def extract_run_paths(data):
@@ -82,27 +71,78 @@ def discover_workflow_cwl_files(streamflow_config_path: Optional[str]) -> list[s
     while to_parse:
         current_file = to_parse.pop(0)
         base_dir = os.path.dirname(current_file)
-        
+
         try:
             with open(current_file, 'r') as f:
                 content = yaml.safe_load(f) or {}
-            
+
             # Find all external files referenced anywhere in this document
             relative_paths = extract_run_paths(content)
-            
+
             for rel_path in relative_paths:
                 # Strip out any URI encoding if present
                 clean_path = unquote(urlparse(rel_path).path)
                 full_path = os.path.realpath(os.path.join(base_dir, clean_path))
-                
+
                 if full_path not in discovered_files and os.path.exists(full_path):
                     discovered_files.add(full_path)
                     to_parse.append(full_path)
-                                
-        except Exception as e:
-            logger.warning(f"YPROV Warning: Could not deep-parse {current_file}: {e}")
+                    logger.info(f"YPROV [DISCOVERY]: Discovered nested CWL file: {full_path}")
 
+        except Exception as e:
+            logger.warning(f"YPROV [DISCOVERY]: Could not deep-parse {current_file}: {e}")
+
+    logger.info(f"YPROV [DISCOVERY]: Total CWL workflow files discovered: {len(discovered_files)}")
     return list(discovered_files)
+
+
+def _resolve_main_cwl_from_db_params(raw_params: Any, base_dir: str) -> Optional[str]:
+    """
+    Resolves the CWL entry point directly from workflow.params, e.g.:
+    {"config": {"file": "./main.cwl", "settings": "./inputs.yml"}, ...}
+
+    This is the ONLY resolution path for offline extraction: unlike the
+    online plugin (which runs inside the same process StreamFlow was
+    invoked from, and can inspect sys.argv/cwd at that moment), offline
+    extraction runs later, possibly from a different working directory,
+    possibly long after the run, so there was never a reliable way to find
+    a streamflow.yml on disk for it to parse in the first place.
+    workflow.params is the authoritative record of what CWL file this
+    SPECIFIC execution actually used, persisted at submission time
+    regardless of what's on disk now.
+
+    base_dir anchors the relative path from params (e.g. "./main.cwl")
+    there's no absolute base directory recorded in params itself, so this is
+    always the current working directory at the time extraction is run.
+    """
+    try:
+        main_cwl_relative = json.loads(raw_params, strict=False)["config"]["file"]
+    except Exception as e:
+        logger.warning(f"YPROV [DB_EXTRACT]: Could not read config.file from workflow.params: {e}")
+        return None
+
+    if not main_cwl_relative:
+        logger.warning("YPROV [DB_EXTRACT]: workflow.params has no config.file entry.")
+        return None
+
+    resolved = os.path.abspath(os.path.realpath(os.path.join(base_dir, main_cwl_relative)))
+    logger.info(f"YPROV [DB_EXTRACT]: Resolved CWL entry point from DB params: {resolved} (relative to {base_dir})")
+    return resolved
+
+
+def discover_workflow_cwl_files(main_cwl_path: Optional[str]) -> list[str]:
+    """
+    Finds every CWL file (transitively) referenced from a workflow's entry
+    point, given the entry point already resolved from workflow.params (see
+    _resolve_main_cwl_from_db_params).
+    """
+    if not main_cwl_path or not os.path.exists(main_cwl_path):
+        logger.warning(f"YPROV [DISCOVERY]: Unable to locate primary CWL file at: {main_cwl_path}")
+        return []
+
+    logger.info(f"YPROV [DISCOVERY]: Using CWL entry point: {main_cwl_path}")
+    return _crawl_cwl_dependencies(main_cwl_path)
+
 
 class yProv4WFsProvenanceManager(ProvenanceManager):
     """
@@ -115,6 +155,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         super().__init__(context, db_context, workflows)
         self.map_file: MutableMapping[str, str] = {}
         self.prov_workflow = None
+        self.main_cwl_path: Optional[str] = None
         
         # Tracking dictionaries for dependency resolution
         self.tasks_by_step_name: MutableMapping[str, List[Task]] = {}
@@ -175,14 +216,13 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         input-to-output dependencies, fully supporting inline and nested steps.
         """
         dependencies = {}
-        streamflow_config_path = self.map_file.get("config")
-        cwl_files = discover_workflow_cwl_files(streamflow_config_path)
+        cwl_files = discover_workflow_cwl_files(self.main_cwl_path)
 
         if not cwl_files:
-            logger.warning("YPROV: No active CWL files discovered via graph parsing.")
+            logger.warning("YPROV [PARSER]: No active CWL files discovered via graph parsing.")
             return dependencies
 
-        logger.info(f"YPROV: Normalized files selected for analysis: {cwl_files}")
+        logger.info(f"YPROV [PARSER]: Files selected for analysis: {cwl_files}")
 
         # Build an index of loaded CWL contents by their filename
         cwl_registry = {}
@@ -194,7 +234,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                     if data:
                         cwl_registry[os.path.basename(filename)] = data
             except Exception as e:
-                logger.warning(f"YPROV: Error reading file {filename}: {e}")
+                logger.warning(f"YPROV [PARSER]: Error reading file {filename}: {e}")
                 continue
 
         # Build a set of valid execution paths from the runtime map 
@@ -258,41 +298,31 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                         if target_filename in cwl_registry:
                             extract_steps_recursive(cwl_registry[target_filename], current_prefix=next_prefix)
                             
-        # Locate the main root workflow directly from streamflow.yml
+        # Locate the main root workflow: the entry point resolved from
+        # workflow.params in populate_prov_workflow(), the authoritative
+        # record of what THIS execution actually used. Falls back to "any
+        # file that declares itself class: Workflow" only if DB resolution
+        # somehow came back empty.
         main_workflow_file = None
-        
-        if streamflow_config_path and os.path.exists(streamflow_config_path):
-            try:
-                with open(streamflow_config_path, 'r') as sf:
-                    sf_data = yaml.safe_load(sf)
-                
-                # Dig down into workflows -> config -> file
-                workflows_sec = sf_data.get('workflows', {})
-                for wf_name, wf_val in workflows_sec.items():
-                    wf_config = wf_val.get('config', {})
-                    wf_file_path = wf_config.get('file')
-                    if wf_file_path:
-                        main_workflow_file = os.path.basename(wf_file_path)
-                        logger.info(f"YPROV: Extracted master root workflow from streamflow.yml: {main_workflow_file}")
-                        break
-            except Exception as e:
-                logger.warning(f"YPROV: Failed reading streamflow.yml for main entrypoint: {e}")
 
-        # Final safety fallback just in case the file reading fails or structure is unexpected
-        if not main_workflow_file:
+        if self.main_cwl_path:
+            main_workflow_file = os.path.basename(self.main_cwl_path)
+            logger.info(f"YPROV [PARSER]: Using DB-resolved root workflow entry point: {main_workflow_file}")
+
+        if not main_workflow_file or main_workflow_file not in cwl_registry:
             for base_name, data in cwl_registry.items():
-                if data.get('class') == 'Workflow':
+                if isinstance(data, dict) and data.get('class') == 'Workflow':
                     main_workflow_file = base_name
                     break
 
         # Kick off parsing
         if main_workflow_file:
-            logger.info(f"YPROV: Starting hierarchical parsing from root workflow entry point: {main_workflow_file}")
+            logger.info(f"YPROV [PARSER]: Starting hierarchical parsing from entrypoint: {main_workflow_file}")
             extract_steps_recursive(cwl_registry[main_workflow_file], current_prefix="")
         else:
-            logger.warning("YPROV: Failed to locate a primary master Workflow file to analyze.")
+            logger.warning("YPROV [PARSER]: Failed to locate a primary master Workflow file to analyze.")
 
-        logger.info(f"YPROV Dependencies list computed: {dependencies}")
+        logger.info(f"YPROV [PARSER]: Computed task dependency links: {dependencies}")
         return dependencies
     
     async def populate_prov_workflow(self) -> Workflow:
@@ -301,6 +331,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         Applies granular execution tracking for scatter nodes while 
         deduplicating their shared array entities.
         """
+        logger.info("YPROV [DB_EXTRACT]: Beginning provenance extraction from database...")
         self.tasks_by_step_name = {}
         
         for wf in self.workflows:
@@ -313,11 +344,22 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
             self.prov_workflow._status = self._get_action_status(Status(wf_obj["status"]))
             self.prov_workflow._engineWMS = 'StreamFlow'
             self.prov_workflow._level = '0'
-            
-            if "config" in self.map_file: 
-                self.prov_workflow._resource_cwl_uri = self.map_file["config"]
+
+            # Resolve the CWL entry point directly from the DB record, since
+            # offline extraction never has a streamflow.yml path handed to it
+            # the way the online plugin does -- only the workflow ID/name.
+            base_dir = os.getcwd()
+            self.main_cwl_path = _resolve_main_cwl_from_db_params(wf_obj["params"], base_dir)
+            if self.main_cwl_path:
+                self.prov_workflow._resource_cwl_uri = self.main_cwl_path
+            else:
+                logger.warning(
+                    "YPROV [DB_EXTRACT]: Could not resolve a CWL entry point from workflow.params -- "
+                    "CWL dependency parsing will be skipped for this workflow."
+                )
 
             # Extract tasks and scatter iterations
+            task_count = 0
             for task_name in wf.steps:
                 clean_name = task_name.lstrip('/')
                 
@@ -325,6 +367,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                     executions = await self.context.database.get_executions_by_step(s.persistent_id)
                     
                     for execution_wf in executions:
+                        task_count += 1
                         task = Task(str(uuid.uuid4()), clean_name)
                         task._start_time = streamflow.core.utils.get_date_from_ns(execution_wf["start_time"])
                         task._end_time = streamflow.core.utils.get_date_from_ns(execution_wf["end_time"])
@@ -382,6 +425,8 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                             task.add_output(data_out)
                             data_out.set_producer(task._id)
 
+            logger.info(f"YPROV [DB_EXTRACT]: Successfully parsed {task_count} task execution records from DB.")
+
             # Resolve structural dependencies
             self.computed_cwl_deps = self._parse_cwl_for_dependencies()
             return self.prov_workflow
@@ -400,6 +445,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         json_file_path = self.prov_workflow.prov_to_json()  
         
         try:
+            logger.info("YPROV [ARCHIVE]: Reconciling graph edges into PROV-JSON schema...")
             with open(json_file_path, 'r') as f: 
                 prov_data = json.load(f)
                 
@@ -481,14 +527,20 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
 
             with open(json_file_path, 'w') as f: 
                 json.dump(prov_data, f, indent=4)
-                
+
+            # Log provenance json file size metrics
+            json_bytes = os.path.getsize(json_file_path)
+            logger.info(f"YPROV [ARCHIVE]: [PROV_FILE_SIZE] provenance.json = {json_bytes} Bytes")
+
         except Exception as e:
-            logger.error(f"YPROV: Internal sync failure: {e}")
+            logger.error(f"YPROV [ARCHIVE]: Internal sync failure during JSON edge cleanup: {e}")
 
         with ZipFile(path, "w") as archive:
             archive.write(json_file_path, arcname="provenance.json")  
             for src, dst in self.map_file.items():
                 if os.path.exists(src) and dst not in archive.namelist(): 
                     archive.write(src, dst)
-                    
-        logger.info(f"YPROV: Successfully created aligned offline yProv4WFs archive at {path}")
+
+        zip_bytes = os.path.getsize(path)
+        logger.info(f"YPROV [ARCHIVE]: [PROV_ARCHIVE_SIZE] {os.path.basename(path)} = {zip_bytes} Bytes")
+        logger.info(f"YPROV [ARCHIVE]: Successfully generated offline yProv4WFs archive at {path}")

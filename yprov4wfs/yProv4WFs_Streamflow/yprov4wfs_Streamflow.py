@@ -266,6 +266,7 @@ if USE_YPROV:
             self.tasks_by_step_name = {}
             self.job_recorded_steps = set()
             self.computed_cwl_deps = {}
+            self._total_flush_count = 0 # total number of flushes done
             # Dynamically intercept the target .yml / .yaml file from the run command
             yaml_args = [arg for arg in sys.argv if arg.endswith(('.yml', '.yaml'))]
             self.streamflow_config_path = yaml_args[0] if yaml_args else "streamflow.yml"
@@ -792,7 +793,12 @@ if USE_YPROV:
 
                 try:
                     file_size = await asyncio.to_thread(self._write_json_file_sync, json_file_path, prov_data)
-                    #_yprov_log(f"[FLUSH SUCCESS] Updated JSON written to: {json_file_path} ({file_size} bytes)")
+                    _yprov_log(f"[PROV_FLUSH] activities={len(prov_data.get('activity', {}))} "
+                            f"entities={len(prov_data.get('entity', {}))} "
+                            f"wasInformedBy={len(prov_data.get('wasInformedBy', {}))} "
+                            f"file_size_bytes={file_size}")
+                    self._total_flush_count += 1 # increment number of flushes
+
                     return json_file_path
                 except Exception as e:
                     _yprov_log(f"JSON Flush Error (write phase): {e}\n{traceback.format_exc()}", level="error")
@@ -1093,6 +1099,8 @@ if USE_YPROV:
                     pass
 
                 _yprov_log("Execution finished successfully. Returning output tokens.")
+
+                _yprov_log(f"[PROV_FLUSHES] total_flushes={self._total_flush_count}")
                 
                 import threading
                 def delayed_exit():
