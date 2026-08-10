@@ -103,8 +103,10 @@ def _yprov_log(msg: str, level: str = "info"):
 def _is_system_spur(name: str) -> bool:
     """Check if a step, port, or entity is an internal StreamFlow runtime component."""
     clean = name.lstrip('/').lower()
-    system_keywords = [
-        "__",
+    if "__" in clean:
+        return True
+    
+    system_keywords = {
         "token-transformer",
         "scatter-combinator",
         "scatter-size-transformer",
@@ -115,8 +117,9 @@ def _is_system_spur(name: str) -> bool:
         "scatter",
         "combinator",
         "broadcaster",
-    ]
-    return any(kw in clean for kw in system_keywords)
+    }
+    segments = clean.split('/')
+    return any(seg in system_keywords for seg in segments)
 
 def _generate_entity_id(step_name: str, port_label: str, p_type: str, p_val: str, p_loc: str, is_output: bool = False) -> str:
     """
@@ -209,8 +212,9 @@ if USE_YPROV:
             except Exception as e:
                 _yprov_log(f"Could not deep-parse {current_file}: {e}", "warning")
         
-        _yprov_log(f"Discovered CWL target files: {list(discovered_files)}")
-        return list(discovered_files)
+        result = sorted(list(discovered_files))
+        _yprov_log(f"Discovered CWL target files: {result}")
+        return result
 
     def _get_action_status(status: Status) -> str:
         if status == Status.COMPLETED:
@@ -846,12 +850,12 @@ if USE_YPROV:
                     with open(real_filename, 'r') as f:
                         data = yaml.safe_load(f)
                         if data:
-                            cwl_registry[os.path.basename(filename)] = data
+                            cwl_registry[real_filename] = data
                 except Exception as e:
                     _yprov_log(f"Error reading CWL file {filename}: {e}", level="warning")
                     continue
 
-            def extract_steps_recursive(workflow_data, current_prefix=""):
+            def extract_steps_recursive(workflow_data, current_prefix="", current_file_path=None):
                 if not isinstance(workflow_data, dict) or workflow_data.get('class') != 'Workflow':
                     return
                 
@@ -894,37 +898,53 @@ if USE_YPROV:
                         next_prefix = f"{current_prefix}/{short_step_name}"
                         
                         if isinstance(run_target, dict):
-                            extract_steps_recursive(run_target, current_prefix=next_prefix)
+                            extract_steps_recursive(run_target, current_prefix=next_prefix, current_file_path=current_file_path)
                         elif isinstance(run_target, str):
-                            target_filename = os.path.basename(run_target)
-                            if target_filename in cwl_registry:
-                                extract_steps_recursive(cwl_registry[target_filename], current_prefix=next_prefix)
+                            clean_path = unquote(urlparse(run_target).path)
+                            target_real_path = None
+                            if current_file_path:
+                                base_dir = os.path.dirname(current_file_path)
+                                target_real_path = os.path.abspath(os.path.realpath(os.path.join(base_dir, clean_path)))
+                            
+                            if target_real_path and target_real_path in cwl_registry:
+                                extract_steps_recursive(cwl_registry[target_real_path], current_prefix=next_prefix, current_file_path=target_real_path)
+                            else:
+                                target_filename = os.path.basename(run_target)
+                                for r_path, r_data in cwl_registry.items():
+                                    if os.path.basename(r_path) == target_filename and r_data.get('class') == 'Workflow':
+                                        extract_steps_recursive(r_data, current_prefix=next_prefix, current_file_path=r_path)
+                                        break
                                 
             main_workflow_file = None
+            main_workflow_path = None
             if streamflow_config_path and os.path.exists(streamflow_config_path):
                 try:
-                    with open(streamflow_config_path, 'r') as sf:
+                    real_config = os.path.abspath(os.path.realpath(streamflow_config_path))
+                    with open(real_config, 'r') as sf:
                         sf_data = yaml.safe_load(sf)
                     workflows_sec = sf_data.get('workflows', {})
                     for wf_name, wf_val in workflows_sec.items():
                         wf_config = wf_val.get('config', {})
                         wf_file_path = wf_config.get('file')
                         if wf_file_path:
+                            config_dir = os.path.dirname(real_config)
+                            main_workflow_path = os.path.abspath(os.path.realpath(os.path.join(config_dir, wf_file_path)))
                             main_workflow_file = os.path.basename(wf_file_path)
                             _yprov_log(f"Extracted root workflow file from streamflow's yml: {main_workflow_file}")
                             break
                 except Exception as e:
                     _yprov_log(f"Failed reading streamflow.yml: {e}", level="warning")
 
-            if not main_workflow_file:
-                for base_name, data in cwl_registry.items():
+            if not main_workflow_path or main_workflow_path not in cwl_registry:
+                for r_path, data in cwl_registry.items():
                     if data.get('class') == 'Workflow':
-                        main_workflow_file = base_name
+                        main_workflow_path = r_path
+                        main_workflow_file = os.path.basename(r_path)
                         break
 
-            if main_workflow_file:
+            if main_workflow_path and main_workflow_path in cwl_registry:
                 _yprov_log(f"Parsing CWL hierarchy starting at root: {main_workflow_file}")
-                extract_steps_recursive(cwl_registry[main_workflow_file], current_prefix="")
+                extract_steps_recursive(cwl_registry[main_workflow_path], current_prefix="", current_file_path=main_workflow_path)
 
             _yprov_log(f"Computed CWL Dependency Graph: {dependencies}")
             return dependencies

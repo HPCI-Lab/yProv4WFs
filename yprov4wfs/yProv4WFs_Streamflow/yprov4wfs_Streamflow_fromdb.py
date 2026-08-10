@@ -233,7 +233,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                 with open(real_filename, 'r') as f:
                     data = yaml.safe_load(f)
                     if data:
-                        cwl_registry[os.path.basename(filename)] = data
+                        cwl_registry[real_filename] = data
             except Exception as e:
                 logger.warning(f"YPROV [PARSER]: Error reading file {filename}: {e}")
                 continue
@@ -245,7 +245,7 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
             normalized_path = '/' + full_path.lstrip('/')
             valid_absolute_paths.add(normalized_path)
 
-        def extract_steps_recursive(workflow_data, current_prefix=""):
+        def extract_steps_recursive(workflow_data, current_file_path, current_prefix=""):
             if not isinstance(workflow_data, dict) or workflow_data.get('class') != 'Workflow':
                 return
             
@@ -293,11 +293,14 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                     next_prefix = f"{current_prefix}/{short_step_name}"
                     
                     if isinstance(run_target, dict):
-                        extract_steps_recursive(run_target, current_prefix=next_prefix)
+                        extract_steps_recursive(run_target, current_file_path, current_prefix=next_prefix)
                     elif isinstance(run_target, str):
-                        target_filename = os.path.basename(run_target)
-                        if target_filename in cwl_registry:
-                            extract_steps_recursive(cwl_registry[target_filename], current_prefix=next_prefix)
+                        # Clean and resolve the absolute path based on the current file's directory
+                        clean_run_path = unquote(urlparse(run_target).path)
+                        target_filepath = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(current_file_path), clean_run_path)))
+                        
+                        if target_filepath in cwl_registry:
+                            extract_steps_recursive(cwl_registry[target_filepath], target_filepath, current_prefix=next_prefix)
                             
         # Locate the main root workflow: the entry point resolved from
         # workflow.params in populate_prov_workflow(), the authoritative
@@ -307,19 +310,19 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
         main_workflow_file = None
 
         if self.main_cwl_path:
-            main_workflow_file = os.path.basename(self.main_cwl_path)
+            main_workflow_file = os.path.abspath(os.path.realpath(self.main_cwl_path))
             logger.info(f"YPROV [PARSER]: Using DB-resolved root workflow entry point: {main_workflow_file}")
 
         if not main_workflow_file or main_workflow_file not in cwl_registry:
-            for base_name, data in cwl_registry.items():
+            for abs_path, data in cwl_registry.items():
                 if isinstance(data, dict) and data.get('class') == 'Workflow':
-                    main_workflow_file = base_name
+                    main_workflow_file = abs_path
                     break
 
         # Kick off parsing
         if main_workflow_file:
             logger.info(f"YPROV [PARSER]: Starting hierarchical parsing from entrypoint: {main_workflow_file}")
-            extract_steps_recursive(cwl_registry[main_workflow_file], current_prefix="")
+            extract_steps_recursive(cwl_registry[main_workflow_file], main_workflow_file, current_prefix="")
         else:
             logger.warning("YPROV [PARSER]: Failed to locate a primary master Workflow file to analyze.")
 
