@@ -116,19 +116,62 @@ def _resolve_main_cwl_from_db_params(raw_params: Any, base_dir: str) -> Optional
     there's no absolute base directory recorded in params itself, so this is
     always the current working directory at the time extraction is run.
     """
+    main_cwl_relative = None
+
+    # Step 1: Try resolving from DB params
     try:
-        main_cwl_relative = json.loads(raw_params, strict=False)["config"]["file"]
+        if isinstance(raw_params, dict):
+            params_dict = raw_params
+        elif isinstance(raw_params, (str, bytes, bytearray)):
+            params_dict = json.loads(raw_params, strict=False)
+        else:
+            params_dict = {}
+
+        main_cwl_relative = params_dict.get("config", {}).get("file")
     except Exception as e:
         logger.warning(f"YPROV [DB_EXTRACT]: Could not read config.file from workflow.params: {e}")
-        return None
 
-    if not main_cwl_relative:
-        logger.warning("YPROV [DB_EXTRACT]: workflow.params has no config.file entry.")
-        return None
+    # Verify if DB resolution found a valid file path on disk[cite: 5]
+    if main_cwl_relative:
+        resolved = os.path.abspath(os.path.realpath(os.path.join(base_dir, main_cwl_relative)))
+        if os.path.exists(resolved):
+            logger.info(f"YPROV [DB_EXTRACT]: Resolved CWL entry point from DB params: {resolved}")
+            return resolved
+        else:
+            logger.warning(f"YPROV [DB_EXTRACT]: DB params point to missing file: {resolved}. Triggering streamflow.yml fallback...")
 
-    resolved = os.path.abspath(os.path.realpath(os.path.join(base_dir, main_cwl_relative)))
-    logger.info(f"YPROV [DB_EXTRACT]: Resolved CWL entry point from DB params: {resolved} (relative to {base_dir})")
-    return resolved
+    # Step 2: Fallback to streamflow.yml
+    streamflow_yml_path = os.path.join(base_dir, "streamflow.yml")
+    if os.path.exists(streamflow_yml_path):
+        logger.info(f"YPROV [DB_EXTRACT]: Fallback engaged. Inspecting streamflow.yml at: {streamflow_yml_path}")
+        try:
+            with open(streamflow_yml_path, "r") as f:
+                sf_config = yaml.safe_load(f) or {}
+
+            # Parse streamflow.yml structure (e.g., config.file or workflows.[name].config.file)
+            fallback_file = None
+            if "config" in sf_config and isinstance(sf_config["config"], dict):
+                fallback_file = sf_config["config"].get("file")
+            elif "workflows" in sf_config and isinstance(sf_config["workflows"], dict):
+                # Pick the file from the first workflow entry found in streamflow.yml
+                for wf_k, wf_v in sf_config["workflows"].items():
+                    if isinstance(wf_v, dict) and "config" in wf_v:
+                        fallback_file = wf_v["config"].get("file")
+                        if fallback_file:
+                            break
+
+            if fallback_file:
+                resolved_fallback = os.path.abspath(os.path.realpath(os.path.join(base_dir, fallback_file)))
+                if os.path.exists(resolved_fallback):
+                    logger.info(f"YPROV [DB_EXTRACT]: Resolved CWL entry point from streamflow.yml: {resolved_fallback}")
+                    return resolved_fallback
+                else:
+                    logger.warning(f"YPROV [DB_EXTRACT]: streamflow.yml points to missing file: {resolved_fallback}")
+        except Exception as e:
+            logger.warning(f"YPROV [DB_EXTRACT]: Failed to parse streamflow.yml: {e}")
+
+    logger.warning("YPROV [DB_EXTRACT]: Could not resolve a valid CWL entry point from DB params or streamflow.yml.")
+    return None
 
 
 def discover_workflow_cwl_files(main_cwl_path: Optional[str]) -> list[str]:
