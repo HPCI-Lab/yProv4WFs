@@ -532,26 +532,28 @@ if USE_YPROV:
             O(T^2) total for a T-task workflow; batching cuts that by roughly
             the batch size.
 
-            Schedules _flush_prov_json_async() as a background task via
-            asyncio.create_task() rather than blocking whatever just captured 
-            a task while the write happens. This is called from both async
-            (_on_job_complete's coroutine wrapper) and plain-sync
-            (_attach_step_monitors' sync wrapper branch) call sites, so it
-            can't safely `await` here itself; create_task() only needs a
-            running event loop, not an async caller.
+            This is called from both the async call site (_on_job_complete's
+            coroutine wrapper, running on self._loop) and the plain-sync call
+            site (_attach_step_monitors' sync wrapper branch, which some
+            StreamFlow execution paths run OFF self._loop's thread, e.g. via
+            a thread pool). The actual create-vs-coalesce decision, and every
+            write, must only ever happen on self._loop's own thread: that's
+            what makes self._flush_lock in _flush_prov_json_async() an
+            effective guarantee rather than a per-thread one. See
+            _schedule_flush().
 
-            At most one flush task is ever in flight at a time: if one is
-            already running when a new batch fills, this just marks that
-            another pass is needed (_flush_again) instead of spawning a
-            second independent task, avoiding both a backlog of redundant
-            writes and any chance of two writes to the same file completing
-            out of order.
-
-            run()'s own end-of-workflow and failure-path calls await
-            _flush_prov_json_async() directly instead of going through this
-            method, the FINAL file write is always waited-on to completion,
-            never a fire-and-forget task that could get cut off by the
-            process exiting.
+            NOTE: a previous version of this method fell back to a
+            synchronous, unguarded write (_flush_prov_json(), no lock) when
+            asyncio.create_task() raised RuntimeError (no running loop on
+            the calling thread). That fallback could run concurrently with
+            an in-flight async flush's write to the same file, producing a
+            torn/incomplete yprov4wfs.json -- reproduced with batch size 1
+            on bursty workflows (e.g. Montage), where many step completions
+            land close together in time and some are dispatched off-thread.
+            The fix below removes that unguarded path entirely: every
+            trigger, regardless of thread, is handed to _schedule_flush()
+            on self._loop, so there is exactly one write path and it is
+            always lock-protected.
             """
             now = time.time()
             should_flush = (
@@ -564,14 +566,51 @@ if USE_YPROV:
             self._pending_since_flush = 0
             self._last_flush_ts = time.time()
 
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+
+            if running_loop is self._loop:
+                # Already on the right thread: decide directly.
+                self._schedule_flush()
+            else:
+                # Called from a different thread (or no loop at all) --
+                # thread-safely hand the create-vs-coalesce decision back
+                # to self._loop instead of writing directly and unguarded.
+                try:
+                    self._loop.call_soon_threadsafe(self._schedule_flush)
+                except RuntimeError:
+                    # self._loop already closed (e.g. a very late trigger
+                    # during shutdown). Not fatal: run()'s own end-of-
+                    # workflow / failure-path calls always await one final
+                    # _flush_prov_json_async() directly, so the last
+                    # snapshot is still guaranteed complete.
+                    _yprov_log(
+                        "Dropped a late flush trigger: event loop already closed.",
+                        level="warning",
+                    )
+
+        def _schedule_flush(self) -> None:
+            """
+            Decides whether to start a new flush task or coalesce into the
+            one already in flight. Must only ever run on self._loop's own
+            thread (called directly from _maybe_flush() when already there,
+            or scheduled via call_soon_threadsafe otherwise) -- that's what
+            makes it safe to touch self._flush_task/self._flush_again here
+            without any additional locking.
+
+            At most one flush task is ever in flight at a time: if one is
+            already running when a new batch fills, this just marks that
+            another pass is needed (_flush_again) instead of spawning a
+            second independent task, avoiding both a backlog of redundant
+            writes and any chance of two writes to the same file completing
+            out of order.
+            """
             if self._flush_task is not None and not self._flush_task.done():
                 self._flush_again = True
-                return None
-
-            try:
-                self._flush_task = asyncio.create_task(self._run_flush_with_coalescing())
-            except RuntimeError:
-                self._flush_prov_json()
+                return
+            self._flush_task = self._loop.create_task(self._run_flush_with_coalescing())
 
         async def _run_flush_with_coalescing(self) -> Optional[str]:
             """
@@ -818,10 +857,17 @@ if USE_YPROV:
 
         def _flush_prov_json(self) -> Optional[str]:
             """
-            Synchronous convenience wrapper, computes the payload and writes
-            it immediately, blocking. Used only as a fallback if no event
-            loop is reachable from the calling context; the async path above
-            is preferred everywhere else.
+            Synchronous, unguarded (no self._flush_lock) write of the
+            current payload -- kept only as an emergency/manual utility.
+
+            No longer called from _maybe_flush(): it used to serve as the
+            no-running-loop fallback there, but writing without the lock
+            is exactly what allowed it to race with an in-flight async
+            flush's write to the same file (root cause of the intermittent
+            malformed yprov4wfs.json seen at batch size 1). _maybe_flush()
+            now always routes through _schedule_flush() on self._loop
+            instead, so every write goes through the locked async path.
+            Do not reintroduce a call to this method from _maybe_flush().
             """
             payload = self._compute_flush_payload()
             if payload is None:
@@ -1037,7 +1083,14 @@ if USE_YPROV:
                 output_tokens = {}
                 _yprov_log(f"Starting execution loop for Workflow ID: {self.workflow.persistent_id}")
                 #_yprov_log(f"Discovered total steps in workflow object: {len(self.workflow.steps)}")
-                
+
+                # Captured once, up front: every flush trigger, no matter
+                # which thread calls _maybe_flush() (main event loop or a
+                # step-monitor wrapper running off-thread), gets handed back
+                # to THIS loop via _schedule_flush(), so self._flush_lock
+                # always actually serializes every write. See _maybe_flush().
+                self._loop = asyncio.get_running_loop()
+
                 start_time_root_ns = time.time_ns()
                 await self.workflow.context.database.update_workflow(
                     self.workflow.persistent_id, {"start_time": start_time_root_ns}
