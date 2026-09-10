@@ -1189,6 +1189,17 @@ if USE_YPROV:
                     zip_dur = time.perf_counter() - t_zip
                     _yprov_log(f"Successfully generated final zip package in {zip_dur:.4f}s at: {path}")
                 
+                # Guard against a late, off-thread flush trigger (queued via
+                # call_soon_threadsafe around the very end of execution)
+                # spinning up an orphaned self._flush_task that nobody
+                # awaits. Without this, delayed_exit's os._exit() below
+                # could fire while that orphaned flush is still writing,
+                # harmless with the atomic write (it only tears the temp
+                # file), but this closes the race outright instead of
+                # relying on atomicity to absorb it.
+                if self._flush_task is not None and not self._flush_task.done():
+                    await self._flush_task
+
                 try:
                     import concurrent.futures.process
                     atexit.unregister(concurrent.futures.process._python_exit)
