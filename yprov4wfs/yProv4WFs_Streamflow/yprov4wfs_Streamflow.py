@@ -804,9 +804,20 @@ if USE_YPROV:
             asyncio.to_thread() (see _flush_prov_json_async). Kept as a plain
             @staticmethod rather than inline code so asyncio.to_thread has a
             single, simple, picklable-argument callable to dispatch.
+
+            Writes to a temp file first, then atomically replaces the target
+            path. This ensures that if the process is killed mid-write (e.g. a
+            scheduler timeout or OOM kill), only the throwaway temp file is
+            left corrupted -- json_file_path itself is never opened for direct
+            writing, so it either still holds the previous complete flush, or
+            the fully-written new one. os.replace() is a single atomic
+            filesystem operation, so there is no window where json_file_path
+            can be observed or left half-written.
             """
-            with open(json_file_path, 'w') as f:
+            tmp_path = f"{json_file_path}.tmp.{os.getpid()}"
+            with open(tmp_path, 'w') as f:
                 json.dump(prov_data, f, indent=4)
+            os.replace(tmp_path, json_file_path)
             return os.path.getsize(json_file_path)
 
         async def _flush_prov_json_async(self) -> Optional[str]:
