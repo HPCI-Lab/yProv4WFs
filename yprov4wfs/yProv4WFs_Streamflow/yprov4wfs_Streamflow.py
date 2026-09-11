@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 import time
 import os
 import sys
@@ -291,6 +292,7 @@ if USE_YPROV:
 
             # Serializes all writes to yprov4wfs.json and coalesces bursty
             # flush requests, see _flush_prov_json_async() / _maybe_flush().
+            self._task_registration_lock = threading.Lock()
             self._flush_lock = asyncio.Lock()
             self._flush_task: Optional[asyncio.Task] = None
             self._flush_again = False
@@ -513,12 +515,12 @@ if USE_YPROV:
             if not self.prov_workflow:
                 _yprov_log("Cannot flush data: prov_workflow is not initialized.", level="warning")
                 return
-
-            self.prov_workflow.add_task(task)
-            
-            if clean_name not in self.tasks_by_step_name:
-                self.tasks_by_step_name[clean_name] = []
-            self.tasks_by_step_name[clean_name].append(task)
+        
+            with self._task_registration_lock:
+                self.prov_workflow.add_task(task)
+                if clean_name not in self.tasks_by_step_name:
+                    self.tasks_by_step_name[clean_name] = []
+                self.tasks_by_step_name[clean_name].append(task)
 
             self._pending_since_flush += 1
             self._maybe_flush()
@@ -1210,7 +1212,6 @@ if USE_YPROV:
 
                 _yprov_log(f"[PROV_FLUSHES] total_flushes={self._total_flush_count}")
                 
-                import threading
                 def delayed_exit():
                     time.sleep(1.0)
                     sys.stdout.flush()
@@ -1418,7 +1419,6 @@ else:
                         {"status": Status.COMPLETED.value, "end_time": time.time_ns()},
                     )
 
-                import threading
                 def delayed_exit():
                     time.sleep(1.0)
                     sys.stdout.flush()
