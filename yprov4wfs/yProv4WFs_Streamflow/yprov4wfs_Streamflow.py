@@ -50,6 +50,7 @@ import atexit
 import logging
 import hashlib
 import traceback
+import re
 from collections.abc import MutableMapping, MutableSequence
 from typing import TYPE_CHECKING, cast, Optional, Set, List, Tuple
 from urllib.parse import urlparse, unquote
@@ -77,13 +78,6 @@ logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 # Environment trigger check
 USE_YPROV = os.getenv("USE_YPROV", "").lower() == "true"
 
-# Intermediate provenance writes are batched instead of happening after every
-# single task. Each write re-serializes and re-purges the WHOLE graph, so
-# writing once per task costs O(T^2) total for a T-task workflow. Flushing
-# every _FLUSH_BATCH_SIZE tasks (or _FLUSH_MIN_INTERVAL_S seconds, whichever
-# comes first) keeps the on-disk file bounded-freshness "online" while
-# cutting total flush cost by roughly the batch size.
-
 # Batch size check
 try:
     _FLUSH_BATCH_SIZE = int(os.getenv("BATCH_SIZE", 10)) # tasks
@@ -95,6 +89,26 @@ except ValueError:
 _FLUSH_MIN_INTERVAL_S = 5.0 * 60.0 # minutes
 
 # -------------------------------------------------------
+# FILE FINGERPRINTING & ARTIFACT REGISTRY
+# -------------------------------------------------------
+# Maps SHA-256 file hash -> producing_task_id
+HASH_REGISTRY: MutableMapping[str, str] = {}
+
+def compute_file_hash(path: Optional[str], chunk_size: int = 65536) -> Optional[str]:
+    """
+    Computes SHA-256 hash of a file safely without loading the full file into memory.
+    Operating system and workflow engine agnostic.
+    """
+    if not path or not isinstance(path, str) or path == "None" or not os.path.isfile(path):
+        return None
+    hasher = hashlib.sha256()
+    try:
+        with open(path, 'rb') as f:
+            while chunk := f.read(chunk_size):
+                hasher.update(chunk)
+        return f"sha256:{hasher.hexdigest()}"
+    except (OSError, IOError):
+        return None
 
 def _yprov_log(msg: str, level: str = "info"):
     """Guaranteed unbuffered console log helper."""
@@ -122,14 +136,111 @@ def _is_system_spur(name: str) -> bool:
     segments = clean.split('/')
     return any(seg in system_keywords for seg in segments)
 
-def _generate_entity_id(step_name: str, port_label: str, p_type: str, p_val: str, p_loc: str, is_output: bool = False) -> str:
+def _get_scatter_tag(task: Any) -> Optional[Tuple[int, ...]]:
     """
-    Generate deterministic Entity IDs scoped strictly to data identity or step/port.
-    Excludes task execution UUIDs to ensure scatter tasks share common entities.
+    Extracts the FULL hierarchical scatter tag from a task's real Job name, as a
+    tuple of ints -- e.g. job name '/band/mProject/0.1.0' -> (0, 1, 0).
+
+    This is a nested tag, not a flat index: its depth (number of components)
+    tracks scatter nesting. A depth-1 tag ('0') means "not scattered" (e.g.
+    get_rgb, color_image). A depth-2 tag ('0.1') means "scattered once" (e.g.
+    per-band steps like extract_bid, mConcatFit). A depth-3 tag ('0.1.0') means
+    "scattered twice" (e.g. per-band-per-tile steps like mProject, mBackground).
+
+    Two tasks belong to the same band/tile group -- and should be connected --
+    exactly when one tag is a prefix of the other, regardless of whether their
+    depths (or raw per-step counts) match. Comparing only the trailing int
+    (the old _get_scatter_index) throws away which band/tile that int belongs
+    to and is NOT sufficient for grouping mismatched-depth pairs correctly.
+    """
+    job_name = str(getattr(task, '_job_name', '') or '')
+    if not job_name:
+        return None
+    tag_str = job_name.rstrip('/').split('/')[-1]
+    parts = tag_str.split('.')
+    if not parts or not all(p.lstrip('-').isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+def _tags_share_lineage(p_tag: Tuple[int, ...], c_tag: Tuple[int, ...]) -> bool:
+    """True iff one tag is a prefix of the other (same band/tile lineage)."""
+    shorter, longer = (p_tag, c_tag) if len(p_tag) <= len(c_tag) else (c_tag, p_tag)
+    return longer[:len(shorter)] == shorter
+
+def _tags_are_compatible(parent_tag: str, child_tag: str) -> bool:
+    """
+    Check if raw job-name tags match exactly or share a parent-child iteration
+    prefix. Mirrors _tags_share_lineage but works directly on the raw string
+    (permissive when either side is missing/empty), so it still catches lineage
+    even when _get_scatter_tag can't parse a tag as pure ints. Ported verbatim
+    from the offline (fromdb) plugin to keep both plugins' matching decisions
+    identical.
+    """
+    if not parent_tag or not child_tag:
+        return True
+    if parent_tag == child_tag:
+        return True
+
+    p_parts = str(parent_tag).strip(".").split(".")
+    c_parts = str(child_tag).strip(".").split(".")
+    min_len = min(len(p_parts), len(c_parts))
+
+    return p_parts[:min_len] == c_parts[:min_len]
+
+def _get_scatter_index(task: Any) -> Optional[int]:
+    """
+    Extracts scatter index or iteration number from a task object or identifier.
+    Supports patterns like: step_name_0, step_name_job_0, step_name[0], step_name/0
+
+    Kept only as a coarse display/legacy helper (used in diagnostic logging).
+    Real edge-matching now uses _get_scatter_tag() + _tags_share_lineage(),
+    since a single trailing int can't express hierarchical band/tile lineage.
+
+    Prefers `task._job_name` (the real Job name StreamFlow assigned this specific
+    scatter iteration, stamped at task-creation time). `task._id` is a random
+    UUID and `task._name`/`task.name` is the shared step name -- neither one has
+    ever carried a real index, so they're kept only as a last-resort fallback for
+    tasks created before this field existed.
+    """
+    t_job = str(getattr(task, '_job_name', '') or '')
+    t_id = str(getattr(task, '_id', '') or getattr(task, 'id', '') or '')
+    t_name = str(getattr(task, '_name', '') or getattr(task, 'name', '') or '')
+
+    for candidate in (t_job, t_id, t_name):
+        if not candidate:
+            continue
+        # Bracket notation: step[0]
+        bracket_match = re.search(r'\[(\d+)\]', candidate)
+        if bracket_match:
+            return int(bracket_match.group(1))
+        # Suffix notation: step_0, step_job_0, step/0, step-0
+        suffix_match = re.search(r'[\/_#-](?:job[_\-]?)?(\d+)$', candidate)
+        if suffix_match:
+            return int(suffix_match.group(1))
+            
+    return None
+
+def _generate_entity_id(
+    step_name: str, 
+    port_label: str, 
+    p_type: str, 
+    p_val: str, 
+    p_loc: str, 
+    is_output: bool = False,
+    file_hash: Optional[str] = None
+) -> str:
+    """
+    Generate deterministic Entity IDs strictly scoped to data content or step/port.
+    If a SHA-256 content hash is available, uses the hash to ensure exact content-addressable matching.
     """
     clean_step = step_name.lstrip('/')
 
-    # File or directory entity with valid path/location
+    # Content-addressable file entity (Decoupled from Streamflow internal paths)
+    if file_hash:
+        clean_hash = file_hash.replace("sha256:", "")[:16]
+        return f"ent_file_{clean_hash}"
+
+    # File or directory entity fallback with valid path/location
     if p_loc and p_loc != "None":
         return f"ent_file_{hashlib.md5(p_loc.encode()).hexdigest()[:12]}"
     
@@ -282,30 +393,17 @@ if USE_YPROV:
             # Memoizes _is_valid_cwl_step() per step name
             self._activity_validity_cache: MutableMapping[str, bool] = {}
 
-            # Batches intermediate writes instead of flushing after every
-            # single task, see _maybe_flush() for the reasoning. Fixed
-            # constants, not env-configurable: USE_YPROV is the only knob.
             self._flush_batch_size = _FLUSH_BATCH_SIZE
             self._flush_min_interval_s = _FLUSH_MIN_INTERVAL_S
             self._pending_since_flush = 0
             self._last_flush_ts = 0.0
 
-            # Serializes all writes to yprov4wfs.json and coalesces bursty
-            # flush requests, see _flush_prov_json_async() / _maybe_flush().
             self._task_registration_lock = threading.Lock()
             self._flush_lock = asyncio.Lock()
             self._flush_task: Optional[asyncio.Task] = None
             self._flush_again = False
 
         def _is_valid_cwl_step(self, clean_name: str) -> bool:
-            """
-            Whitelist match against CWL hierarchy with name normalization.
-
-            Memoized by clean_name: this gets called once per activity on
-            every flush (so hundreds of times for a heavily-scattered step),
-            but a given step name's validity never changes once decided, so
-            re-running the regex/normalization work every time is pure waste.
-            """
             cached = self._activity_validity_cache.get(clean_name)
             if cached is not None:
                 return cached
@@ -315,22 +413,17 @@ if USE_YPROV:
             return result
 
         def _compute_is_valid_cwl_step(self, clean_name: str) -> bool:
-            # Immediately drop internal StreamFlow keywords (*injector, *transformer, etc.)
             if _is_system_spur(clean_name):
                 return False
 
-            # Fallback if CWL parsing produced no steps
             if not self.computed_cwl_deps:
                 return True
 
-            import re
-            # Strip scatter indices (_0, [0]) from each path segment
             parts = clean_name.lstrip('/').split('/')
             cleaned_parts = [re.sub(r'(_\d+|\[\d+\])$', '', p) for p in parts]
             normalized_path = "/" + "/".join(cleaned_parts)
             base_step_name = cleaned_parts[-1]
 
-            # Check if normalized path or base step matches CWL dependencies
             for cwl_key in self.computed_cwl_deps.keys():
                 cwl_base = cwl_key.lstrip('/').split('/')[-1]
                 if cwl_key == normalized_path or cwl_base == base_step_name:
@@ -360,75 +453,124 @@ if USE_YPROV:
                         if inspect.iscoroutinefunction(orig_method):
                             async def wrapper(*args, **kwargs):
                                 start_ns = time.time_ns()
+                                job_obj = kwargs.get('job') or (args[0] if args else None)
                                 try:
                                     res = await orig_method(*args, **kwargs)
                                     end_ns = time.time_ns()
-                                    self._on_job_complete(step, start_ns, end_ns, status=Status.COMPLETED)
+                                    actual_status = getattr(step, "status", Status.COMPLETED)
+                                    self._on_job_complete(step, start_ns, end_ns, status=actual_status, job=job_obj)
                                     return res
                                 except Exception:
                                     end_ns = time.time_ns()
-                                    self._on_job_complete(step, start_ns, end_ns, status=Status.FAILED)
+                                    self._on_job_complete(step, start_ns, end_ns, status=Status.FAILED, job=job_obj)
                                     raise
                             wrapper._is_yprov_hook = True
                             setattr(step, method_name, wrapper)
                         else:
                             def wrapper(*args, **kwargs):
                                 start_ns = time.time_ns()
+                                job_obj = kwargs.get('job') or (args[0] if args else None)
                                 try:
                                     res = orig_method(*args, **kwargs)
                                     end_ns = time.time_ns()
-                                    self._on_job_complete(step, start_ns, end_ns, status=Status.COMPLETED)
+                                    actual_status = getattr(step, "status", Status.COMPLETED)
+                                    self._on_job_complete(step, start_ns, end_ns, status=actual_status, job=job_obj)
                                     return res
                                 except Exception:
                                     end_ns = time.time_ns()
-                                    self._on_job_complete(step, start_ns, end_ns, status=Status.FAILED)
+                                    self._on_job_complete(step, start_ns, end_ns, status=Status.FAILED, job=job_obj)
                                     raise
                             wrapper._is_yprov_hook = True
                             setattr(step, method_name, wrapper)
 
-        def _on_job_complete(self, step: Step, start_time_ns: int, end_time_ns: int, status: Status = Status.COMPLETED):
+        def _create_task_from_step(
+            self, 
+            step: Step, 
+            start_time_ns: int, 
+            end_time_ns: int, 
+            status: Status = Status.COMPLETED,
+            job: Any = None
+        ) -> Optional[YProvTask]:
+            """
+            Builds a YProvTask with incremental SHA-256 fingerprinting for input and output files.
+            """
             clean_name = step.name.lstrip('/')
             if not self._is_valid_cwl_step(clean_name):
-                return
+                return None
 
-            self.job_recorded_steps.add(clean_name)
+            if status in (Status.CANCELLED, Status.SKIPPED):
+                _yprov_log(f"Skipping provenance record for '{clean_name}': status={status}", level="debug")
+                return None
+
             task_id = str(uuid.uuid4())
-
             task = YProvTask(task_id, clean_name)
             task._start_time = sf_utils.get_date_from_ns(start_time_ns)
             task._end_time = sf_utils.get_date_from_ns(end_time_ns)
             task._status = _get_action_status(status)
             task._level = '1'
 
-            # Extract Inputs
+            job_name = getattr(job, 'name', None) or getattr(job, 'get_name', lambda: None)()
+            if job_name:
+                task._job_name = str(job_name)
+                if not hasattr(self, '_logged_job_name_steps'):
+                    self._logged_job_name_steps = set()
+                if clean_name not in self._logged_job_name_steps:
+                    self._logged_job_name_steps.add(clean_name)
+            else:
+                task._job_name = None
+
+            # Extract Inputs with SHA-256 Fingerprinting
             in_ports = step.get_input_ports() if hasattr(step, 'get_input_ports') else getattr(step, 'input_ports', {})
             for port_name, port_obj in in_ports.items():
                 port_label = port_name.split('/')[-1]
                 if _is_system_spur(port_label) or _is_system_spur(port_name):
                     continue
                 dt, dv, dl = _extract_memory_port_metadata(port_obj)
-                data_id = _generate_entity_id(clean_name, port_label, dt, dv, dl, is_output=False)
+                
+                # Compute SHA-256 hash for file artifacts on disk
+                file_hash = compute_file_hash(dl) if dl and dl != "None" else None
+                data_id = _generate_entity_id(clean_name, port_label, dt, dv, dl, is_output=False, file_hash=file_hash)
                 
                 data_in = YProvData(data_id, port_label)
                 data_in._type, data_in._value, data_in._location = dt, dv, dl
                 task.add_input(data_in)
                 data_in.add_consumer(task._id)
 
-            # Extract Outputs
+            # Extract Outputs with SHA-256 Fingerprinting & Registry Mapping
             out_ports = step.get_output_ports() if hasattr(step, 'get_output_ports') else getattr(step, 'output_ports', {})
             for port_name, port_obj in out_ports.items():
                 port_label = port_name.split('/')[-1]
                 if _is_system_spur(port_label) or _is_system_spur(port_name):
                     continue
                 dt, dv, dl = _extract_memory_port_metadata(port_obj)
-                data_id = _generate_entity_id(clean_name, port_label, dt, dv, dl, is_output=True)
+                
+                # Compute SHA-256 hash for file artifacts on disk
+                file_hash = compute_file_hash(dl) if dl and dl != "None" else None
+                data_id = _generate_entity_id(clean_name, port_label, dt, dv, dl, is_output=True, file_hash=file_hash)
 
                 data_out = YProvData(data_id, port_label)
                 data_out._type, data_out._value, data_out._location = dt, dv, dl
                 task.add_output(data_out)
                 data_out.set_producer(task._id)
 
-            self.register_and_flush_task(clean_name, task)
+                # Store file fingerprint in global registry
+                if file_hash:
+                    HASH_REGISTRY[file_hash] = task._id
+
+            return task
+
+        def _on_job_complete(self, step: Step, start_time_ns: int, end_time_ns: int, status: Status = Status.COMPLETED, job: Any = None):
+            clean_name = step.name.lstrip('/')
+            task = self._create_task_from_step(step, start_time_ns, end_time_ns, status, job=job)
+            if task:
+                self.job_recorded_steps.add(clean_name)
+                self.register_and_flush_task(clean_name, task)
+
+        def _on_step_complete(self, step: Step, start_time_ns: int, end_time_ns: int, status: Status = Status.COMPLETED):
+            clean_name = step.name.lstrip('/')
+            task = self._create_task_from_step(step, start_time_ns, end_time_ns, status)
+            if task:
+                self.register_and_flush_task(clean_name, task)
 
         async def _run_monitored_step(self, step: Step) -> Any:
             """Direct Coroutine Wrapper replacing monkey-patching completely."""
@@ -438,9 +580,6 @@ if USE_YPROV:
             clean_name = step.name.lstrip('/')
             is_valid = self._is_valid_cwl_step(clean_name)
 
-            # if is_valid:
-            #     _yprov_log(f"[STEP START] Launching execution for step: '{clean_name}'")
-
             start_time_ns = time.time_ns()
             self._attach_step_monitors(step)
 
@@ -449,11 +588,9 @@ if USE_YPROV:
                 end_time_ns = time.time_ns()
                 
                 if is_valid:
-                    duration = (end_time_ns - start_time_ns) / 1e9
-                    #_yprov_log(f"[STEP COMPLETE] Step '{clean_name}' finished in {duration:.2f}s")
-
                     if clean_name not in self.job_recorded_steps:
-                        self._on_step_complete(step, start_time_ns, end_time_ns, status=Status.COMPLETED)
+                        actual_status = getattr(step, "status", Status.COMPLETED)
+                        self._on_step_complete(step, start_time_ns, end_time_ns, status=actual_status)
 
                 return result
             
@@ -467,49 +604,6 @@ if USE_YPROV:
                     if clean_name not in self.job_recorded_steps:
                         self._on_step_complete(step, start_time_ns, end_time_ns, status=Status.FAILED)
                 raise
-
-        def _on_step_complete(self, step: Step, start_time_ns: int, end_time_ns: int, status: Status = Status.COMPLETED):
-            clean_name = step.name.lstrip('/')
-
-            if not self._is_valid_cwl_step(clean_name):
-                return
-
-            task_id = str(uuid.uuid4())
-            task = YProvTask(task_id, clean_name)
-            task._start_time = sf_utils.get_date_from_ns(start_time_ns)
-            task._end_time = sf_utils.get_date_from_ns(end_time_ns)
-            task._status = _get_action_status(status)
-            task._level = '1'
-
-            # Extract Inputs
-            in_ports = step.get_input_ports() if hasattr(step, 'get_input_ports') else getattr(step, 'input_ports', {})
-            for port_name, port_obj in in_ports.items():
-                port_label = port_name.split('/')[-1]
-                if _is_system_spur(port_label) or _is_system_spur(port_name):
-                    continue
-                dt, dv, dl = _extract_memory_port_metadata(port_obj)
-                data_id = _generate_entity_id(clean_name, port_label, dt, dv, dl, is_output=False)
-
-                data_in = YProvData(data_id, port_label)
-                data_in._type, data_in._value, data_in._location = dt, dv, dl
-                task.add_input(data_in)
-                data_in.add_consumer(task._id)
-
-            # Extract Outputs
-            out_ports = step.get_output_ports() if hasattr(step, 'get_output_ports') else getattr(step, 'output_ports', {})
-            for port_name, port_obj in out_ports.items():
-                port_label = port_name.split('/')[-1]
-                if _is_system_spur(port_label) or _is_system_spur(port_name):
-                    continue
-                dt, dv, dl = _extract_memory_port_metadata(port_obj)
-                data_id = _generate_entity_id(clean_name, port_label, dt, dv, dl, is_output=True)
-
-                data_out = YProvData(data_id, port_label)
-                data_out._type, data_out._value, data_out._location = dt, dv, dl
-                task.add_output(data_out)
-                data_out.set_producer(task._id)
-
-            self.register_and_flush_task(clean_name, task)
 
         def register_and_flush_task(self, clean_name: str, task: YProvTask) -> None:
             if not self.prov_workflow:
@@ -526,37 +620,6 @@ if USE_YPROV:
             self._maybe_flush()
 
         def _maybe_flush(self) -> None:
-            """
-            Writes an intermediate snapshot after every _FLUSH_BATCH_SIZE
-            captured tasks, or after _FLUSH_MIN_INTERVAL_S seconds since the
-            last flush, whichever comes first. Each flush re-serializes and
-            re-purges the WHOLE graph, so writing once per task would cost
-            O(T^2) total for a T-task workflow; batching cuts that by roughly
-            the batch size.
-
-            This is called from both the async call site (_on_job_complete's
-            coroutine wrapper, running on self._loop) and the plain-sync call
-            site (_attach_step_monitors' sync wrapper branch, which some
-            StreamFlow execution paths run OFF self._loop's thread, e.g. via
-            a thread pool). The actual create-vs-coalesce decision, and every
-            write, must only ever happen on self._loop's own thread: that's
-            what makes self._flush_lock in _flush_prov_json_async() an
-            effective guarantee rather than a per-thread one. See
-            _schedule_flush().
-
-            NOTE: a previous version of this method fell back to a
-            synchronous, unguarded write (_flush_prov_json(), no lock) when
-            asyncio.create_task() raised RuntimeError (no running loop on
-            the calling thread). That fallback could run concurrently with
-            an in-flight async flush's write to the same file, producing a
-            torn/incomplete yprov4wfs.json -- reproduced with batch size 1
-            on bursty workflows (e.g. Montage), where many step completions
-            land close together in time and some are dispatched off-thread.
-            The fix below removes that unguarded path entirely: every
-            trigger, regardless of thread, is handed to _schedule_flush()
-            on self._loop, so there is exactly one write path and it is
-            always lock-protected.
-            """
             now = time.time()
             should_flush = (
                 self._pending_since_flush >= self._flush_batch_size
@@ -574,57 +637,23 @@ if USE_YPROV:
                 running_loop = None
 
             if running_loop is self._loop:
-                # Already on the right thread: decide directly.
                 self._schedule_flush()
             else:
-                # Called from a different thread (or no loop at all) --
-                # thread-safely hand the create-vs-coalesce decision back
-                # to self._loop instead of writing directly and unguarded.
                 try:
                     self._loop.call_soon_threadsafe(self._schedule_flush)
                 except RuntimeError:
-                    # self._loop already closed (e.g. a very late trigger
-                    # during shutdown). Not fatal: run()'s own end-of-
-                    # workflow / failure-path calls always await one final
-                    # _flush_prov_json_async() directly, so the last
-                    # snapshot is still guaranteed complete.
                     _yprov_log(
                         "Dropped a late flush trigger: event loop already closed.",
                         level="warning",
                     )
 
         def _schedule_flush(self) -> None:
-            """
-            Decides whether to start a new flush task or coalesce into the
-            one already in flight. Must only ever run on self._loop's own
-            thread (called directly from _maybe_flush() when already there,
-            or scheduled via call_soon_threadsafe otherwise) -- that's what
-            makes it safe to touch self._flush_task/self._flush_again here
-            without any additional locking.
-
-            At most one flush task is ever in flight at a time: if one is
-            already running when a new batch fills, this just marks that
-            another pass is needed (_flush_again) instead of spawning a
-            second independent task, avoiding both a backlog of redundant
-            writes and any chance of two writes to the same file completing
-            out of order.
-            """
             if self._flush_task is not None and not self._flush_task.done():
                 self._flush_again = True
                 return
             self._flush_task = self._loop.create_task(self._run_flush_with_coalescing())
 
         async def _run_flush_with_coalescing(self) -> Optional[str]:
-            """
-            Runs one flush, then, if more tasks were captured while it was
-            running, runs exactly one more, instead of letting a backlog of
-            redundant flush tasks pile up. _flush_prov_json_async() itself
-            still serializes against any OTHER in-flight flush via
-            self._flush_lock: this method keeps the number of scheduled
-            flush tasks at any moment to at most one, and the lock guarantees 
-            that even if two ever coexisted, their writes could never complete 
-            out of order.
-            """
             result = await self._flush_prov_json_async()
             if self._flush_again:
                 self._flush_again = False
@@ -635,12 +664,9 @@ if USE_YPROV:
             """
             Builds the purged/edge-injected provenance dict entirely in memory
             and returns (target_path, prov_data) WITHOUT touching disk.
-
-            Uses to_prov() (the library's in-memory JSON-string builder)
-            instead of prov_to_json() (which does its own blocking write to
-            disk that we'd immediately overwrite anyway). That removes one
-            full write + one full re-read per flush.
+            Includes deep diagnostic logging for wasInformedBy generation.
             """
+            
             try:
                 os.makedirs(self.outdir, exist_ok=True)
                 prov_json_str = self.prov_workflow.to_prov()
@@ -655,8 +681,6 @@ if USE_YPROV:
                 # STRICT WHITELIST & ENTITY FILTERING
                 # -----------------------------------------------------------
                 def is_valid_cwl_activity(label: str) -> bool:
-                    # Delegate to the single shared, memoized check used at
-                    # attach-time
                     return self._is_valid_cwl_step(label)
 
                 def _get_prov_id(val: Any) -> Optional[str]:
@@ -743,55 +767,235 @@ if USE_YPROV:
                         if ent_id in referenced_entity_ids
                     }
 
-                # Re-inject explicit step-to-step dependencies (wasInformedBy) between valid tasks
-                prov_data["wasInformedBy"] = {} 
+                # -----------------------------------------------------------
+                # EDGE INJECTION DIAGNOSTICS & RESOLUTION
+                # -----------------------------------------------------------
+                prov_data["wasInformedBy"] = {}
                 existing_relations = set()
+                edge_stats_by_pair = {}
+                def _inject_edge(p_uuid: str, c_uuid: str, reason: str = "") -> None:
+                    if p_uuid == c_uuid:
+                        # reject self-loop edges (task informing itself) as invalid
+                        return
 
-                def _inject_edge(p_uuid: str, c_uuid: str) -> None:
-                    if p_uuid != c_uuid and (c_uuid, p_uuid) not in existing_relations:
-                        if p_uuid in valid_activity_ids and c_uuid in valid_activity_ids:
-                            rel_key = f"_:informed_{hashlib.md5(f'{c_uuid}{p_uuid}'.encode()).hexdigest()[:8]}"
-                            prov_data["wasInformedBy"][rel_key] = {"prov:informed": c_uuid, "prov:informant": p_uuid}
-                            existing_relations.add((c_uuid, p_uuid))
+                    if (c_uuid, p_uuid) in existing_relations:
+                        # skipped duplicate edges (already injected) to avoid redundant entries in wasInformedBy
+                        return
 
-                def _resolve_leaf_tasks(step_name: str) -> List[Any]:
+                    if p_uuid in valid_activity_ids and c_uuid in valid_activity_ids:
+                        # injet edge only if both parent and child are valid CWL activities
+                        rel_key = f"_:informed_{hashlib.md5(f'{c_uuid}{p_uuid}'.encode()).hexdigest()[:8]}"
+                        prov_data["wasInformedBy"][rel_key] = {"prov:informed": c_uuid, "prov:informant": p_uuid}
+                        existing_relations.add((c_uuid, p_uuid))
+                    #else: 
+                        # invalid activity UUIDs detected
+
+                all_cwl_paths = set(self.computed_cwl_deps.keys())
+                for parent_list in self.computed_cwl_deps.values():
+                    all_cwl_paths.update(parent_list)
+
+                def is_composite(path: str) -> bool:
+                    clean_p = path.lstrip('/')
+                    prefix = f"{clean_p}/"
+                    return any(p.lstrip('/').startswith(prefix) for p in all_cwl_paths if p != path)
+
+                def get_leaf_descendants(path: str) -> List[str]:
+                    clean_p = path.lstrip('/')
+                    if not is_composite(path):
+                        return [path]
+                    prefix = f"{clean_p}/"
+                    leaves = [
+                        p for p in all_cwl_paths 
+                        if p.lstrip('/').startswith(prefix) and not is_composite(p)
+                    ]
+                    return leaves if leaves else [path]
+
+                def get_entry_leaves(path: str) -> List[str]:
+                    if not is_composite(path):
+                        return [path]
+                    leaves = get_leaf_descendants(path)
+                    leaf_set = set(leaves)
+                    entry_leaves = []
+                    for leaf in leaves:
+                        parents = self.computed_cwl_deps.get(leaf, [])
+                        has_internal_parent = any(
+                            any(pl in leaf_set for pl in get_leaf_descendants(p))
+                            for p in parents
+                        )
+                        if not has_internal_parent:
+                            entry_leaves.append(leaf)
+                    return entry_leaves if entry_leaves else leaves
+
+                def get_exit_leaves(path: str) -> List[str]:
+                    if not is_composite(path):
+                        return [path]
+                    leaves = get_leaf_descendants(path)
+                    leaf_set = set(leaves)
+                    exit_leaves = []
+                    for leaf in leaves:
+                        is_dep_for_internal = False
+                        for child, parents in self.computed_cwl_deps.items():
+                            child_leaves = get_leaf_descendants(child)
+                            if any(cl in leaf_set for cl in child_leaves) and child != leaf:
+                                if any(leaf in get_leaf_descendants(p) for p in parents):
+                                    is_dep_for_internal = True
+                                    break
+                        if not is_dep_for_internal:
+                            exit_leaves.append(leaf)
+                    return exit_leaves if exit_leaves else leaves
+
+                def _get_exact_leaf_tasks(step_name: str) -> List[Any]:
                     clean_s = step_name.lstrip('/')
                     exact_match = (
                         self.tasks_by_step_name.get(clean_s) 
                         or self.tasks_by_step_name.get(f"/{clean_s}")
                     )
+                    found_tasks = []
                     if exact_match:
-                        return [t for t in exact_match if t._id in valid_activity_ids]
+                        found_tasks = [t for t in exact_match if t._id in valid_activity_ids]
+                    else:
+                        prefix = f"{clean_s}/"
+                        for task_name, tasks in self.tasks_by_step_name.items():
+                            normalized_name = task_name.lstrip('/')
+                            if normalized_name.startswith(prefix):
+                                found_tasks.extend([t for t in tasks if t._id in valid_activity_ids])
+
+                    return found_tasks
+
+                def _get_task_sort_key(task: Any) -> Tuple[Tuple[str, ...], Tuple[str, ...], str]:
+                    inputs = getattr(task, 'inputs', getattr(task, '_inputs', []))
+                    outputs = getattr(task, 'outputs', getattr(task, '_outputs', []))
                     
-                    prefix = f"{clean_s}/"
-                    child_tasks = []
-                    for task_name, tasks in self.tasks_by_step_name.items():
-                        normalized_name = task_name.lstrip('/')
-                        if normalized_name.startswith(prefix):
-                            child_tasks.extend([t for t in tasks if t._id in valid_activity_ids])
-                    return child_tasks
+                    in_keys = sorted([
+                        str(getattr(d, '_location', None) or getattr(d, '_value', None) or getattr(d, '_id', ''))
+                        for d in inputs
+                    ])
+                    out_keys = sorted([
+                        str(getattr(d, '_location', None) or getattr(d, '_value', None) or getattr(d, '_id', ''))
+                        for d in outputs
+                    ])
+                    return (tuple(in_keys), tuple(out_keys), getattr(task, '_id', ''))
+
+                def _get_entity_keys(task: Any, is_output: bool) -> set:
+                    """
+                    Content-based identity for a task's ports: real file location or
+                    real scalar value. Ported verbatim from the offline (fromdb)
+                    plugin -- used as the layer between lineage-tag matching and the
+                    last-resort cross-product fallback, so both plugins fall back
+                    identically when lineage tags aren't available for a pair.
+                    """
+                    items = getattr(task, 'outputs' if is_output else 'inputs',
+                                     getattr(task, '_outputs' if is_output else '_inputs', []))
+                    keys = set()
+                    for d in items:
+                        loc = getattr(d, '_location', None)
+                        val = getattr(d, '_value', None)
+                        did = getattr(d, '_id', None)
+                        if loc and str(loc) != "None":
+                            keys.add(f"loc:{loc}")
+                        if val and str(val) != "None":
+                            keys.add(f"val:{val}")
+                        if did:
+                            keys.add(f"id:{did}")
+                    return keys
 
                 for child_path, parent_paths in self.computed_cwl_deps.items():
-                    child_tasks = _resolve_leaf_tasks(child_path)
-                    if not child_tasks: 
-                        continue
+                    child_entries = get_entry_leaves(child_path)
 
                     for parent_path in parent_paths:
-                        parent_tasks = _resolve_leaf_tasks(parent_path)
-                        if not parent_tasks: 
-                            continue
+                        parent_exits = get_exit_leaves(parent_path)
+                        pair_key = f"{parent_path} -> {child_path}"
 
-                        p_len, c_len = len(parent_tasks), len(child_tasks)
-                        
-                        if p_len == 1 and c_len > 1:
-                            for c_task in child_tasks: _inject_edge(parent_tasks[0]._id, c_task._id)
-                        elif c_len == 1 and p_len > 1:
-                            for p_task in parent_tasks: _inject_edge(p_task._id, child_tasks[0]._id)
-                        elif p_len == c_len:
-                            for p_task, c_task in zip(parent_tasks, child_tasks): _inject_edge(p_task._id, c_task._id)
-                        else:
-                            for p_task in parent_tasks:
-                                for c_task in child_tasks: _inject_edge(p_task._id, c_task._id)
+                        for p_leaf in parent_exits:
+                            parent_tasks = _get_exact_leaf_tasks(p_leaf)
+                            if not parent_tasks:
+                                # no parent tasks found for this leaf, skip to next parent
+                                continue
+
+                            for c_leaf in child_entries:
+                                child_tasks = _get_exact_leaf_tasks(c_leaf)
+                                if not child_tasks:
+                                    # no child tasks found for this leaf, skip to next child
+                                    continue
+
+                                p_len, c_len = len(parent_tasks), len(child_tasks)
+                                before_count = len(prov_data["wasInformedBy"])
+
+                                # 1. Broadcast (1 -> N): Single parent feeds all child instances
+                                if p_len == 1 and c_len > 1:
+                                    # routing pattern: single parent task informs multiple child tasks (broadcast)
+                                    for c_task in child_tasks:
+                                        _inject_edge(parent_tasks[0]._id, c_task._id, reason="Broadcast 1->N")
+
+                                # 2. Gather (N -> 1): All parent instances feed single child
+                                elif c_len == 1 and p_len > 1:
+                                    # routing pattern: multiple parent tasks inform single child task (gather)
+                                    for p_task in parent_tasks:
+                                        _inject_edge(p_task._id, child_tasks[0]._id, reason="Gather N->1")
+
+                                # 3. Single Task Link (1 -> 1)
+                                elif p_len == 1 and c_len == 1:
+                                    # routing pattern: single parent task informs single child task (1-to-1)
+                                    _inject_edge(parent_tasks[0]._id, child_tasks[0]._id, reason="Single 1->1")
+
+                                # 4. Parallel Scatter (N -> M): match by shared band/tile lineage
+                                else:
+                                    # routing pattern: multiple parent tasks inform multiple child tasks (parallel scatter)
+
+                                    p_tags = {id(pt): _get_scatter_tag(pt) for pt in parent_tasks}
+                                    c_tags = {id(ct): _get_scatter_tag(ct) for ct in child_tasks}
+
+                                    if all(p_tags.values()) and all(c_tags.values()):
+                                        # Real hierarchical lineage available on every task on both
+                                        # sides. Connect any (parent, child) pair whose tags share a
+                                        # prefix relationship (int-tuple check), OR whose raw job-name
+                                        # tags are compatible (string-prefix check, permissive when a
+                                        # tag is missing) -- same combined condition the offline
+                                        # plugin uses, so both plugins make identical decisions here.
+                                        for ct in child_tasks:
+                                            c_tag = c_tags[id(ct)]
+                                            matched = False
+                                            for pt in parent_tasks:
+                                                p_tag = p_tags[id(pt)]
+                                                if _tags_share_lineage(p_tag, c_tag) or _tags_are_compatible(getattr(pt, '_job_name', ''), getattr(ct, '_job_name', '')):
+                                                    _inject_edge(pt._id, ct._id, reason=f"Lineage Match (parent={p_tag}, child={c_tag})")
+                                                    matched = True
+                                            if not matched:
+                                                # No parent tag matched this child tag; log a warning for diagnostic purposes
+                                                pass
+
+                                    # Fallback for unindexed steps of identical length: match 1:1 by sort key
+                                    elif p_len == c_len:
+                                        # Sort both parent and child task lists by a deterministic key (inputs, outputs, ID) to ensure consistent ordering
+                                        sorted_parents = sorted(parent_tasks, key=_get_task_sort_key)
+                                        sorted_children = sorted(child_tasks, key=_get_task_sort_key)
+                                        for p_task, c_task in zip(sorted_parents, sorted_children):
+                                            _inject_edge(p_task._id, c_task._id, reason="Sorted Key Fallback N->N")
+
+                                    # No usable lineage tags AND mismatched counts: same layered
+                                    # fallback as the offline plugin -- try content-based (real
+                                    # location/value) matching first, and only cross-product as an
+                                    # absolute last resort, still gated by tag compatibility.
+                                    else:
+                                        matched_any = False
+                                        for p_task in parent_tasks:
+                                            p_keys = _get_entity_keys(p_task, is_output=True)
+                                            if not p_keys:
+                                                continue
+                                            for c_task in child_tasks:
+                                                c_keys = _get_entity_keys(c_task, is_output=False)
+                                                if p_keys & c_keys:
+                                                    _inject_edge(p_task._id, c_task._id, reason="Content Match (loc/val)")
+                                                    matched_any = True
+
+                                        if not matched_any:
+                                            for p_task in parent_tasks:
+                                                for c_task in child_tasks:
+                                                    if _tags_are_compatible(getattr(p_task, '_job_name', ''), getattr(c_task, '_job_name', '')):
+                                                        _inject_edge(p_task._id, c_task._id, reason="Compatibility-Gated Cross Product")
+
+                                added_edges = len(prov_data["wasInformedBy"]) - before_count
+                                edge_stats_by_pair[pair_key] = edge_stats_by_pair.get(pair_key, 0) + added_edges
 
                 return json_file_path, prov_data
 
@@ -801,21 +1005,6 @@ if USE_YPROV:
 
         @staticmethod
         def _write_json_file_sync(json_file_path: str, prov_data: MutableMapping[str, Any]) -> int:
-            """
-            The actual blocking disk write, run off the event loop thread via
-            asyncio.to_thread() (see _flush_prov_json_async). Kept as a plain
-            @staticmethod rather than inline code so asyncio.to_thread has a
-            single, simple, picklable-argument callable to dispatch.
-
-            Writes to a temp file first, then atomically replaces the target
-            path. This ensures that if the process is killed mid-write (e.g. a
-            scheduler timeout or OOM kill), only the throwaway temp file is
-            left corrupted -- json_file_path itself is never opened for direct
-            writing, so it either still holds the previous complete flush, or
-            the fully-written new one. os.replace() is a single atomic
-            filesystem operation, so there is no window where json_file_path
-            can be observed or left half-written.
-            """
             tmp_path = f"{json_file_path}.tmp.{os.getpid()}"
             with open(tmp_path, 'w') as f:
                 json.dump(prov_data, f, indent=4)
@@ -823,24 +1012,6 @@ if USE_YPROV:
             return os.path.getsize(json_file_path)
 
         async def _flush_prov_json_async(self) -> Optional[str]:
-            """
-            Computes the purged/edge-injected snapshot, then performs the 
-            actual disk write via asyncio.to_thread() so the write itself 
-            doesn't block the event loop while StreamFlow is scheduling 
-            other steps.
-
-            Wrapped in self._flush_lock so that even if this ever gets
-            invoked from more than one place concurrently, the compute-then-
-            write sequence is atomic end-to-end: payload computation happens
-            AFTER acquiring the lock, so a flush that had to wait picks up
-            the freshest state rather than a stale snapshot, and writes can
-            never land on disk out of order. Without this, multiple
-            fire-and-forget flush tasks dispatched via asyncio.to_thread's
-            thread pool could have their writes to the SAME file complete out
-            of order; an older, smaller snapshot finishing AFTER a newer,
-            more complete one, silently clobbering it with less data even
-            though nothing was actually lost from self.prov_workflow itself.
-            """
             async with self._flush_lock:
                 t_payload = time.perf_counter()
                 payload = self._compute_flush_payload()
@@ -861,7 +1032,7 @@ if USE_YPROV:
                             f"payload_build_s={payload_dur:.4f} "
                             f"flush_write_s={flush_duration_s:.4f}")
 
-                    self._total_flush_count += 1 # increment number of flushes
+                    self._total_flush_count += 1
 
                     return json_file_path
                 except Exception as e:
@@ -869,19 +1040,6 @@ if USE_YPROV:
                     return None
 
         def _flush_prov_json(self) -> Optional[str]:
-            """
-            Synchronous, unguarded (no self._flush_lock) write of the
-            current payload -- kept only as an emergency/manual utility.
-
-            No longer called from _maybe_flush(): it used to serve as the
-            no-running-loop fallback there, but writing without the lock
-            is exactly what allowed it to race with an in-flight async
-            flush's write to the same file (root cause of the intermittent
-            malformed yprov4wfs.json seen at batch size 1). _maybe_flush()
-            now always routes through _schedule_flush() on self._loop
-            instead, so every write goes through the locked async path.
-            Do not reintroduce a call to this method from _maybe_flush().
-            """
             payload = self._compute_flush_payload()
             if payload is None:
                 return None
@@ -1022,9 +1180,8 @@ if USE_YPROV:
         async def _shutdown(self):
             if self.closed:
                 return
-            self.closed = True  # Block concurrent calls immediately
+            self.closed = True
 
-            # Cancel all background task executions BEFORE tearing down connectors
             current_task = asyncio.current_task()
             pending_tasks = []
             
@@ -1037,7 +1194,6 @@ if USE_YPROV:
             if pending_tasks:
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
 
-            # Terminate remaining steps cleanly
             await asyncio.gather(
                 *(
                     asyncio.create_task(step.terminate(Status.CANCELLED))
@@ -1095,13 +1251,7 @@ if USE_YPROV:
             try:
                 output_tokens = {}
                 _yprov_log(f"Starting execution loop for Workflow ID: {self.workflow.persistent_id}")
-                #_yprov_log(f"Discovered total steps in workflow object: {len(self.workflow.steps)}")
 
-                # Captured once, up front: every flush trigger, no matter
-                # which thread calls _maybe_flush() (main event loop or a
-                # step-monitor wrapper running off-thread), gets handed back
-                # to THIS loop via _schedule_flush(), so self._flush_lock
-                # always actually serializes every write. See _maybe_flush().
                 self._loop = asyncio.get_running_loop()
 
                 start_time_root_ns = time.time_ns()
@@ -1109,7 +1259,6 @@ if USE_YPROV:
                     self.workflow.persistent_id, {"start_time": start_time_root_ns}
                 )
 
-                # Initialize master workflow wrapper & parse CWL dependencies upfront
                 self.prov_workflow = YProvWorkflow(self.workflow.name, f'workflow_{self.workflow.name}')
                 self.prov_workflow._start_time = sf_utils.get_date_from_ns(start_time_root_ns)
                 self.prov_workflow._engineWMS = 'StreamFlow'
@@ -1121,13 +1270,11 @@ if USE_YPROV:
                 self.computed_cwl_deps = self._parse_cwl_for_dependencies()
                 _yprov_log(f"YPROV [PARSER]: CWL graph parsing completed in {time.perf_counter() - t_cwl:.4f}s")
 
-                # Schedule ALL workflow steps to avoid DAG token deadlocks
                 for task_name, step in self.workflow.steps.items():
                     clean_name = step.name.lstrip('/')
 
                     if self._is_valid_cwl_step(clean_name):
                         self._attach_step_monitors(step)
-                        #_yprov_log(f"Scheduling step '{step.name}' via _run_monitored_step")
 
                     execution = asyncio.create_task(
                         self._handle_exception(asyncio.create_task(self._run_monitored_step(step))),
@@ -1153,7 +1300,6 @@ if USE_YPROV:
                     await asyncio.gather(*self.executions)
 
                 if self.executions:
-                    #_yprov_log("Synchronizing background steps...")
                     done, pending = await asyncio.wait(self.executions, timeout=3.0)
                     if pending:
                         _yprov_log(f"{len(pending)} steps did not join within timeout.", level="warning")
@@ -1175,7 +1321,6 @@ if USE_YPROV:
                         {"status": Status.COMPLETED.value, "end_time": end_time_root_ns},
                     )
                 
-                # Final flush & package
                 json_file_path = await self._flush_prov_json_async()
 
                 if json_file_path and os.path.exists(json_file_path):
@@ -1190,15 +1335,7 @@ if USE_YPROV:
                     
                     zip_dur = time.perf_counter() - t_zip
                     _yprov_log(f"Successfully generated final zip package in {zip_dur:.4f}s at: {path}")
-                
-                # Guard against a late, off-thread flush trigger (queued via
-                # call_soon_threadsafe around the very end of execution)
-                # spinning up an orphaned self._flush_task that nobody
-                # awaits. Without this, delayed_exit's os._exit() below
-                # could fire while that orphaned flush is still writing,
-                # harmless with the atomic write (it only tears the temp
-                # file), but this closes the race outright instead of
-                # relying on atomicity to absorb it.
+
                 if self._flush_task is not None and not self._flush_task.done():
                     await self._flush_task
 
@@ -1209,7 +1346,6 @@ if USE_YPROV:
                     pass
 
                 _yprov_log("Execution finished successfully. Returning output tokens.")
-
                 _yprov_log(f"[PROV_FLUSHES] total_flushes={self._total_flush_count}")
                 
                 def delayed_exit():
@@ -1236,14 +1372,12 @@ if USE_YPROV:
                 if not self.closed:
                     await self._shutdown()
 
-                # Clean error summary banner output
                 logger.error("\n" + "=" * 62)
                 logger.error(" WORKFLOW EXECUTION FAILED")
                 logger.error(f" Reason: {reason}")
                 logger.error(" Provenance: yprov4wfs.json updated and saved successfully.")
                 logger.error("=" * 62 + "\n")
                 
-                # Flush standard I/O streams and hard-exit cleanly
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(1)
@@ -1274,14 +1408,12 @@ if USE_YPROV:
                 sys.stderr.flush()
                 os._exit(1)
 
-
         async def close(self) -> None:
             if self._closed:
                 return
             if self._closing is not None:
                 await self._closing.wait()
             else:
-                # Terminate all steps
                 await asyncio.gather(
                     *(
                         asyncio.create_task(step.terminate(Status.CANCELLED))
@@ -1289,7 +1421,6 @@ if USE_YPROV:
                         if not step.terminated
                     )
                 )
-                # Mark the executor as closed
                 self._closed = True
 
         async def closed(self) -> bool:
@@ -1444,7 +1575,6 @@ else:
             if self._closing is not None:
                 await self._closing.wait()
             else:
-                # Terminate all steps
                 await asyncio.gather(
                     *(
                         asyncio.create_task(step.terminate(Status.CANCELLED))
@@ -1452,7 +1582,6 @@ else:
                         if not step.terminated
                     )
                 )
-                # Mark the executor as closed
                 self._closed = True
 
         async def closed(self) -> bool:

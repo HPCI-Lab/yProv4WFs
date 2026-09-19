@@ -20,6 +20,7 @@ import yaml
 import time
 import logging
 import hashlib
+import traceback
 from abc import abstractmethod
 from zipfile import ZipFile
 from urllib.parse import urlparse, unquote
@@ -39,12 +40,23 @@ from yprov4wfs.datamodel.data import Data
 # Silence aiosqlite background logging
 logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 
+def _tags_are_compatible(parent_tag: str, child_tag: str) -> bool:
+    """Check if task tags match exactly or share a parent-child iteration prefix."""
+    if not parent_tag or not child_tag:
+        return True
+    if parent_tag == child_tag:
+        return True
+
+    p_parts = str(parent_tag).strip(".").split(".")
+    c_parts = str(child_tag).strip(".").split(".")
+    min_len = min(len(p_parts), len(c_parts))
+
+    return p_parts[:min_len] == c_parts[:min_len]
 
 def _crawl_cwl_dependencies(main_cwl_path: str) -> list[str]:
     """
     Recursively crawls a KNOWN CWL entry-point file for every 'run: ...cwl'
-    reference it (transitively) contains. Doesn't care how main_cwl_path was
-    determined -- that's the job of the two resolver functions below.
+    reference it (transitively) contains.
     """
     if not main_cwl_path or not os.path.exists(main_cwl_path):
         logger.warning(f"YPROV [DISCOVERY]: Unable to locate primary CWL file at: {main_cwl_path}")
@@ -77,11 +89,9 @@ def _crawl_cwl_dependencies(main_cwl_path: str) -> list[str]:
             with open(current_file, 'r') as f:
                 content = yaml.safe_load(f) or {}
 
-            # Find all external files referenced anywhere in this document
             relative_paths = extract_run_paths(content)
 
             for rel_path in relative_paths:
-                # Strip out any URI encoding if present
                 clean_path = unquote(urlparse(rel_path).path)
                 full_path = os.path.realpath(os.path.join(base_dir, clean_path))
 
@@ -99,26 +109,10 @@ def _crawl_cwl_dependencies(main_cwl_path: str) -> list[str]:
 
 def _resolve_main_cwl_from_db_params(raw_params: Any, base_dir: str) -> Optional[str]:
     """
-    Resolves the CWL entry point directly from workflow.params, e.g.:
-    {"config": {"file": "./main.cwl", "settings": "./inputs.yml"}, ...}
-
-    This is the ONLY resolution path for offline extraction: unlike the
-    online plugin (which runs inside the same process StreamFlow was
-    invoked from, and can inspect sys.argv/cwd at that moment), offline
-    extraction runs later, possibly from a different working directory,
-    possibly long after the run, so there was never a reliable way to find
-    a streamflow.yml on disk for it to parse in the first place.
-    workflow.params is the authoritative record of what CWL file this
-    SPECIFIC execution actually used, persisted at submission time
-    regardless of what's on disk now.
-
-    base_dir anchors the relative path from params (e.g. "./main.cwl") --
-    there's no absolute base directory recorded in params itself, so this is
-    always the current working directory at the time extraction is run.
+    Resolves the CWL entry point directly from workflow.params.
     """
     main_cwl_relative = None
 
-    # Step 1: Try resolving from DB params
     try:
         if isinstance(raw_params, dict):
             params_dict = raw_params
@@ -131,7 +125,6 @@ def _resolve_main_cwl_from_db_params(raw_params: Any, base_dir: str) -> Optional
     except Exception as e:
         logger.warning(f"YPROV [DB_EXTRACT]: Could not read config.file from workflow.params: {e}")
 
-    # Verify if DB resolution found a valid file path on disk[cite: 5]
     if main_cwl_relative:
         resolved = os.path.abspath(os.path.realpath(os.path.join(base_dir, main_cwl_relative)))
         if os.path.exists(resolved):
@@ -140,7 +133,7 @@ def _resolve_main_cwl_from_db_params(raw_params: Any, base_dir: str) -> Optional
         else:
             logger.warning(f"YPROV [DB_EXTRACT]: DB params point to missing file: {resolved}. Triggering streamflow.yml fallback...")
 
-    # Step 2: Fallback to streamflow.yml
+    # Fallback to streamflow.yml
     streamflow_yml_path = os.path.join(base_dir, "streamflow.yml")
     if os.path.exists(streamflow_yml_path):
         logger.info(f"YPROV [DB_EXTRACT]: Fallback engaged. Inspecting streamflow.yml at: {streamflow_yml_path}")
@@ -148,12 +141,10 @@ def _resolve_main_cwl_from_db_params(raw_params: Any, base_dir: str) -> Optional
             with open(streamflow_yml_path, "r") as f:
                 sf_config = yaml.safe_load(f) or {}
 
-            # Parse streamflow.yml structure (e.g., config.file or workflows.[name].config.file)
             fallback_file = None
             if "config" in sf_config and isinstance(sf_config["config"], dict):
                 fallback_file = sf_config["config"].get("file")
             elif "workflows" in sf_config and isinstance(sf_config["workflows"], dict):
-                # Pick the file from the first workflow entry found in streamflow.yml
                 for wf_k, wf_v in sf_config["workflows"].items():
                     if isinstance(wf_v, dict) and "config" in wf_v:
                         fallback_file = wf_v["config"].get("file")
@@ -176,9 +167,7 @@ def _resolve_main_cwl_from_db_params(raw_params: Any, base_dir: str) -> Optional
 
 def discover_workflow_cwl_files(main_cwl_path: Optional[str]) -> list[str]:
     """
-    Finds every CWL file (transitively) referenced from a workflow's entry
-    point, given the entry point already resolved from workflow.params (see
-    _resolve_main_cwl_from_db_params).
+    Finds every CWL file (transitively) referenced from a workflow's entry point.
     """
     if not main_cwl_path or not os.path.exists(main_cwl_path):
         logger.warning(f"YPROV [DISCOVERY]: Unable to locate primary CWL file at: {main_cwl_path}")
@@ -186,6 +175,26 @@ def discover_workflow_cwl_files(main_cwl_path: Optional[str]) -> list[str]:
 
     logger.info(f"YPROV [DISCOVERY]: Using CWL entry point: {main_cwl_path}")
     return _crawl_cwl_dependencies(main_cwl_path)
+
+
+def _get_scatter_tag(task: Any) -> Optional[Tuple[int, ...]]:
+    """
+    Extracts the FULL hierarchical scatter tag from a task's real job name/tag,
+    as a tuple of ints -- e.g. '/band/mProject/0.1.0' -> (0, 1, 0).
+    """
+    job_name = str(getattr(task, '_job_name', '') or '')
+    if not job_name:
+        return None
+    tag_str = job_name.rstrip('/').split('/')[-1]
+    parts = tag_str.split('.')
+    if not parts or not all(p.lstrip('-').isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+def _tags_share_lineage(p_tag: Tuple[int, ...], c_tag: Tuple[int, ...]) -> bool:
+    """True iff one tag is a prefix of the other (same band/tile lineage)."""
+    shorter, longer = (p_tag, c_tag) if len(p_tag) <= len(c_tag) else (c_tag, p_tag)
+    return longer[:len(shorter)] == shorter
 
 
 class yProv4WFsProvenanceManager(ProvenanceManager):
@@ -221,12 +230,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
     def _extract_port_metadata(self, port_db_record: Any) -> Tuple[str, str, str]:
         """
         Reconstructs type and location signatures from database port value blobs.
-        
-        Args:
-            port_db_record (Any): The database dictionary entry for a port.
-            
-        Returns:
-            Tuple[str, str, str]: Extracted (type, value, location).
         """
         p_type = "string"
         p_val = "None"
@@ -268,7 +271,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
 
         logger.info(f"YPROV [PARSER]: Files selected for analysis: {cwl_files}")
 
-        # Build an index of loaded CWL contents by their filename
         cwl_registry = {}
         for filename in cwl_files:
             try:
@@ -281,8 +283,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                 logger.warning(f"YPROV [PARSER]: Error reading file {filename}: {e}")
                 continue
 
-        # Build a set of valid execution paths from the runtime map 
-        # (Prevents duplicate short names from overwriting each other)
         valid_absolute_paths = set()
         for full_path in self.tasks_by_step_name.keys():
             normalized_path = '/' + full_path.lstrip('/')
@@ -301,7 +301,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                 short_step_name = step_id.split('/')[-1]
                 full_step_name = f"{current_prefix}/{short_step_name}"
 
-                # Unconditionally add every step found in the CWL
                 if full_step_name not in dependencies:
                     dependencies[full_step_name] = []
                 
@@ -326,11 +325,9 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                                 else:
                                     full_parent_name = f"{current_prefix}/{parent_short_name}"
 
-                                # Unconditionally map the parent relationship
                                 if full_parent_name not in dependencies[full_step_name]:
                                     dependencies[full_step_name].append(full_parent_name)
 
-                # Recursive check
                 if isinstance(step_val, dict) and 'run' in step_val:
                     run_target = step_val['run']
                     next_prefix = f"{current_prefix}/{short_step_name}"
@@ -338,18 +335,12 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                     if isinstance(run_target, dict):
                         extract_steps_recursive(run_target, current_file_path, current_prefix=next_prefix)
                     elif isinstance(run_target, str):
-                        # Clean and resolve the absolute path based on the current file's directory
                         clean_run_path = unquote(urlparse(run_target).path)
                         target_filepath = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(current_file_path), clean_run_path)))
                         
                         if target_filepath in cwl_registry:
                             extract_steps_recursive(cwl_registry[target_filepath], target_filepath, current_prefix=next_prefix)
-                            
-        # Locate the main root workflow: the entry point resolved from
-        # workflow.params in populate_prov_workflow(), the authoritative
-        # record of what THIS execution actually used. Falls back to "any
-        # file that declares itself class: Workflow" only if DB resolution
-        # somehow came back empty.
+
         main_workflow_file = None
 
         if self.main_cwl_path:
@@ -362,7 +353,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                     main_workflow_file = abs_path
                     break
 
-        # Kick off parsing
         if main_workflow_file:
             logger.info(f"YPROV [PARSER]: Starting hierarchical parsing from entrypoint: {main_workflow_file}")
             extract_steps_recursive(cwl_registry[main_workflow_file], main_workflow_file, current_prefix="")
@@ -393,9 +383,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
             self.prov_workflow._engineWMS = 'StreamFlow'
             self.prov_workflow._level = '0'
 
-            # Resolve the CWL entry point directly from the DB record, since
-            # offline extraction never has a streamflow.yml path handed to it
-            # the way the online plugin does -- only the workflow ID/name.
             base_dir = os.getcwd()
             self.main_cwl_path = _resolve_main_cwl_from_db_params(wf_obj["params"], base_dir)
             if self.main_cwl_path:
@@ -421,7 +408,47 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                         task._end_time = streamflow.core.utils.get_date_from_ns(execution_wf["end_time"])
                         task._status = self._get_action_status(Status(execution_wf["status"]))
                         task._level = '1'
-                        
+
+                        if not hasattr(self, '_logged_execution_row_steps'):
+                            self._logged_execution_row_steps = set()
+                        if clean_name not in self._logged_execution_row_steps:
+                            try:
+                                row_repr = dict(execution_wf) if hasattr(execution_wf, 'keys') else execution_wf
+                            except Exception:
+                                row_repr = repr(execution_wf)
+                            self._logged_execution_row_steps.add(clean_name)
+
+                        job_tag = None
+                        for key in ('name', 'job_name', 'tag', 'job_tag'):
+                            try:
+                                v = execution_wf[key] if hasattr(execution_wf, 'keys') else getattr(execution_wf, key, None)
+                            except Exception:
+                                v = None
+                            if v:
+                                job_tag = str(v)
+                                break
+                        if not job_tag:
+                            job_id = None
+                            for key in ('job', 'job_id'):
+                                try:
+                                    job_id = execution_wf[key] if hasattr(execution_wf, 'keys') else getattr(execution_wf, key, None)
+                                except Exception:
+                                    job_id = None
+                                if job_id:
+                                    break
+                            if job_id is not None:
+                                for getter_name in ('get_job', 'get_job_by_id'):
+                                    getter = getattr(self.context.database, getter_name, None)
+                                    if getter:
+                                        try:
+                                            job_row = await getter(job_id)
+                                            job_tag = job_row.get('name') if hasattr(job_row, 'get') else getattr(job_row, 'name', None)
+                                        except Exception:
+                                            job_tag = None
+                                        if job_tag:
+                                            break
+                        task._job_name = job_tag
+
                         self.prov_workflow.add_task(task)
                         
                         # Register task mappings for topological dependency resolution
@@ -440,12 +467,10 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                             port_label = input_port["name"].split('/')[-1]
                             label_low = port_label.lower()
                             
-                            # Drop Streamflow internal control tokens
                             if ("__" in port_label or port_label.startswith("_") or "job" in label_low or 
                                 "-injector" in label_low or "-collector" in label_low or "token" in label_low): 
                                 continue
 
-                            # Use a deterministic hash of the step name and port label to avoid entity duplication
                             data_id = f"ent_in_{hashlib.md5(f'{clean_name}_{port_label}'.encode()).hexdigest()[:8]}"
                             data_in = Data(data_id, port_label)
                             dt, dv, dl = self._extract_port_metadata(input_port)
@@ -464,7 +489,6 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
                                 "-injector" in label_low or "-collector" in label_low or "token" in label_low): 
                                 continue
                             
-                            # Use a deterministic hash of the step name and port label to avoid entity duplication
                             data_id = f"ent_out_{hashlib.md5(f'{clean_name}_{port_label}'.encode()).hexdigest()[:8]}"
                             data_out = Data(data_id, port_label)
                             dt, dv, dl = self._extract_port_metadata(output_port)
@@ -502,93 +526,333 @@ class yProv4WFsProvenanceManager(ProvenanceManager):
             logger.info("YPROV [ARCHIVE]: Reconciling graph edges into PROV-JSON schema...")
             with open(json_file_path, 'r') as f: 
                 prov_data = json.load(f)
+
+            # -----------------------------------------------------------
+            # STRICT WHITELIST & ENTITY FILTERING
+            # -----------------------------------------------------------
+            valid_step_names = set(self.tasks_by_step_name.keys())
+            valid_step_names.update([f"/{k.lstrip('/')}" for k in self.tasks_by_step_name.keys()])
+            valid_step_names.update([k.lstrip('/') for k in self.tasks_by_step_name.keys()])
+
+            def _is_system_spur(s: str) -> bool:
+                if not s:
+                    return False
+                s_low = str(s).lower()
+                return ("__" in str(s) or "job" in s_low or "-injector" in s_low or 
+                        "-collector" in s_low or "-token-transformer" in s_low or 
+                        "-scatter" in s_low or "-condition" in s_low)
+
+            def is_valid_cwl_activity(label: str) -> bool:
+                if not label or _is_system_spur(label):
+                    return False
+                clean_lbl = label.lstrip('/')
+                return clean_lbl in valid_step_names or any(clean_lbl.startswith(f"{s}/") for s in valid_step_names)
+
+            def _get_prov_id(val: Any) -> Optional[str]:
+                if isinstance(val, str):
+                    return val
+                if isinstance(val, dict):
+                    return val.get("$") or val.get("prov:id")
+                return None
+
+            def _get_prov_label(val: Any) -> str:
+                if isinstance(val, dict):
+                    label = val.get("prov:label") or val.get("yprov:name") or val.get("yprov:label") or ""
+                    if isinstance(label, dict):
+                        return label.get("$", "")
+                    return str(label)
+                return str(val) if val else ""
+
+            # Purge non-CWL activities
+            valid_activity_ids = set()
+            activities = prov_data.get("activity", {})
+            for act_id, act_val in list(activities.items()):
+                label = _get_prov_label(act_val)
+                if not label:
+                    for v in act_val.values() if isinstance(act_val, dict) else []:
+                        v_str = _get_prov_id(v) or str(v)
+                        if is_valid_cwl_activity(v_str):
+                            label = v_str
+                            break
                 
+                if label and is_valid_cwl_activity(label):
+                    valid_activity_ids.add(act_id)
+                else:
+                    del activities[act_id]
+
+            # Filter out system spur entities
+            entities = prov_data.get("entity", {})
+            candidate_entity_ids = set()
+            for ent_id, ent_val in list(entities.items()):
+                label = _get_prov_label(ent_val) or ent_id
+                if _is_system_spur(label) or _is_system_spur(ent_id):
+                    del entities[ent_id]
+                else:
+                    candidate_entity_ids.add(ent_id)
+
+            # Clean up relations referring to purged activities or spur entities
+            referenced_entity_ids = set()
+
+            for r_type in ["used", "wasGeneratedBy"]:
+                if r_type in prov_data:
+                    cleaned_rels = {}
+                    for rel_id, rel_val in prov_data[r_type].items():
+                        if not isinstance(rel_val, dict):
+                            continue
+                        act_id = _get_prov_id(rel_val.get("prov:activity"))
+                        ent_id = _get_prov_id(rel_val.get("prov:entity"))
+                        
+                        if act_id in valid_activity_ids and ent_id in candidate_entity_ids:
+                            cleaned_rels[rel_id] = rel_val
+                            if ent_id:
+                                referenced_entity_ids.add(ent_id)
+                    prov_data[r_type] = cleaned_rels
+
+            if "wasAssociatedWith" in prov_data:
+                prov_data["wasAssociatedWith"] = {
+                    k: v for k, v in prov_data["wasAssociatedWith"].items()
+                    if isinstance(v, dict) and _get_prov_id(v.get("prov:activity")) in valid_activity_ids
+                }
+
+            if "wasDerivedFrom" in prov_data:
+                cleaned_derived = {}
+                for rel_id, rel_val in prov_data["wasDerivedFrom"].items():
+                    if not isinstance(rel_val, dict):
+                        continue
+                    gen_ent = _get_prov_id(rel_val.get("prov:generatedEntity"))
+                    used_ent = _get_prov_id(rel_val.get("prov:usedEntity"))
+                    if gen_ent in referenced_entity_ids and used_ent in referenced_entity_ids:
+                        cleaned_derived[rel_id] = rel_val
+                prov_data["wasDerivedFrom"] = cleaned_derived
+
+            # Clean up orphan / unreferenced entities
+            if "entity" in prov_data:
+                prov_data["entity"] = {
+                    ent_id: ent_val for ent_id, ent_val in prov_data["entity"].items()
+                    if ent_id in referenced_entity_ids
+                }
+
+            # -----------------------------------------------------------
+            # EDGE RECONCILIATION & COMPOSITE BOUNDARY RESOLUTION
+            # -----------------------------------------------------------
             prov_data["wasInformedBy"] = {} 
             existing_relations = set()
 
             def _inject_edge(p_uuid: str, c_uuid: str) -> None:
-                """Helper to inject cryptographically stable dependency edges."""
                 if p_uuid != c_uuid and (c_uuid, p_uuid) not in existing_relations:
-                    rel_key = f"_:informed_{hashlib.md5(f'{c_uuid}{p_uuid}'.encode()).hexdigest()[:8]}"
-                    prov_data["wasInformedBy"][rel_key] = {"prov:informed": c_uuid, "prov:informant": p_uuid}
-                    existing_relations.add((c_uuid, p_uuid))
+                    if p_uuid in valid_activity_ids and c_uuid in valid_activity_ids:
+                        rel_key = f"_:informed_{hashlib.md5(f'{c_uuid}{p_uuid}'.encode()).hexdigest()[:8]}"
+                        prov_data["wasInformedBy"][rel_key] = {"prov:informed": c_uuid, "prov:informant": p_uuid}
+                        existing_relations.add((c_uuid, p_uuid))
 
-            def _resolve_leaf_tasks(step_name: str) -> List[Task]:
-                """Resolves a CWL step to its leaf tasks via direct or prefix match."""
-                exact_match = self.tasks_by_step_name.get(step_name) or self.tasks_by_step_name.get(f"/{step_name.lstrip('/')}")
-                if exact_match:
-                    return exact_match
+            # Full set of CWL paths (keys + every parent listed), used to tell a
+            # composite (subworkflow) path from a true leaf/atomic step.
+            all_cwl_paths = set(self.computed_cwl_deps.keys())
+            for _parent_list in self.computed_cwl_deps.values():
+                all_cwl_paths.update(_parent_list)
+
+            def is_composite(path: str) -> bool:
+                clean_p = path.lstrip('/')
+                prefix = f"{clean_p}/"
+                return any(p.lstrip('/').startswith(prefix) for p in all_cwl_paths if p != path)
+
+            def get_leaf_descendants(path: str) -> List[str]:
+                clean_p = path.lstrip('/')
+                if not is_composite(path):
+                    return [path]
+                prefix = f"{clean_p}/"
+                leaves = [p for p in all_cwl_paths if p.lstrip('/').startswith(prefix) and not is_composite(p)]
+                return leaves if leaves else [path]
+
+            def get_entry_leaves(path: str) -> List[str]:
+                """
+                The leaf(s) of a composite that have no parent WITHIN the same
+                composite -- i.e. where external data actually flows in. Without
+                this, resolving a composite (e.g. '/band/wdiff') directly through
+                _get_exact_leaf_tasks()'s prefix fallback returns EVERY descendant
+                leaf, not just the true entry point -- which is exactly what wires
+                a parent up to internal leaves it never actually feeds (e.g.
+                extract_bid -> mDiffFit/check_mDiffFit_out, when only
+                extract_bid -> get_diff is real).
+                """
+                if not is_composite(path):
+                    return [path]
+                leaves = get_leaf_descendants(path)
+                leaf_set = set(leaves)
+                entry_leaves = []
+                for leaf in leaves:
+                    parents = self.computed_cwl_deps.get(leaf, [])
+                    has_internal_parent = any(
+                        any(pl in leaf_set for pl in get_leaf_descendants(p))
+                        for p in parents
+                    )
+                    if not has_internal_parent:
+                        entry_leaves.append(leaf)
+                return entry_leaves if entry_leaves else leaves
+
+            def get_exit_leaves(path: str) -> List[str]:
+                """The leaf(s) of a composite that nothing else INSIDE it depends on
+                -- i.e. where the composite's real output comes from. Symmetric to
+                get_entry_leaves(); same rationale (e.g. '/band' must resolve to
+                just mViewer, not every band-internal step, when feeding get_rgb)."""
+                if not is_composite(path):
+                    return [path]
+                leaves = get_leaf_descendants(path)
+                leaf_set = set(leaves)
+                exit_leaves = []
+                for leaf in leaves:
+                    is_dep_for_internal = False
+                    for child, parents in self.computed_cwl_deps.items():
+                        child_leaves = get_leaf_descendants(child)
+                        if any(cl in leaf_set for cl in child_leaves) and child != leaf:
+                            if any(leaf in get_leaf_descendants(p) for p in parents):
+                                is_dep_for_internal = True
+                                break
+                    if not is_dep_for_internal:
+                        exit_leaves.append(leaf)
+                return exit_leaves if exit_leaves else leaves
+
+            def _get_exact_leaf_tasks(step_name: str) -> List[Task]:
+                clean_s = step_name.lstrip('/')
                 
-                prefix = f"/{step_name.lstrip('/')}/"
-                child_tasks = []
-                for task_name, tasks in self.tasks_by_step_name.items():
-                    normalized_name = f"/{task_name.lstrip('/')}"
-                    if normalized_name.startswith(prefix):
-                        child_tasks.extend(tasks)
-                return child_tasks
+                # 1. Exact match lookup
+                exact_match = (
+                    self.tasks_by_step_name.get(clean_s) 
+                    or self.tasks_by_step_name.get(f"/{clean_s}")
+                )
+                if exact_match:
+                    return [t for t in exact_match if t._id in valid_activity_ids]
+                    
+                # 2. Sub-workflow prefix fallback (e.g., 'band/wdiff' -> 'band/wdiff/...')
+                prefix_tasks = []
+                prefix_key = f"{clean_s}/"
+                for s_name, tasks in self.tasks_by_step_name.items():
+                    clean_key = s_name.lstrip('/')
+                    if clean_key.startswith(prefix_key):
+                        prefix_tasks.extend([t for t in tasks if t._id in valid_activity_ids])
+                        
+                return prefix_tasks
 
+            def _get_task_sort_key(task: Any) -> Tuple[Tuple[str, ...], Tuple[str, ...], str]:
+                """Deterministic sorting key based on input/output entity identifiers."""
+                inputs = getattr(task, 'inputs', getattr(task, '_inputs', []))
+                outputs = getattr(task, 'outputs', getattr(task, '_outputs', []))
+                
+                in_keys = sorted([
+                    str(getattr(d, '_location', None) or getattr(d, '_value', None) or getattr(d, '_id', ''))
+                    for d in inputs
+                ])
+                out_keys = sorted([
+                    str(getattr(d, '_location', None) or getattr(d, '_value', None) or getattr(d, '_id', ''))
+                    for d in outputs
+                ])
+                return (tuple(in_keys), tuple(out_keys), getattr(task, '_id', ''))
+
+            def _get_entity_keys(task: Any, is_output: bool) -> set:
+                items = getattr(task, 'outputs' if is_output else 'inputs', getattr(task, '_outputs' if is_output else '_inputs', []))
+                keys = set()
+                for d in items:
+                    loc = getattr(d, '_location', None)
+                    val = getattr(d, '_value', None)
+                    did = getattr(d, '_id', None)
+                    if loc and str(loc) != "None":
+                        keys.add(f"loc:{loc}")
+                    if val and str(val) != "None":
+                        keys.add(f"val:{val}")
+                    if did:
+                        keys.add(f"id:{did}")
+                return keys
+
+            # Map relations across step boundaries and composite subworkflows.
+            # Resolve each composite path down to its true entry/exit leaf(s)
+            # FIRST -- calling _get_exact_leaf_tasks directly on a composite path
+            # (child_path/parent_path) falls into its prefix-fallback, which
+            # returns every descendant leaf, not just the true boundary.
             for child_path, parent_paths in self.computed_cwl_deps.items():
-                child_tasks = _resolve_leaf_tasks(child_path)
-                if not child_tasks: 
-                    continue
+                child_entries = get_entry_leaves(child_path)
 
                 for parent_path in parent_paths:
-                    parent_tasks = _resolve_leaf_tasks(parent_path)
-                    if not parent_tasks: 
-                        continue
+                    parent_exits = get_exit_leaves(parent_path)
 
-                    p_len, c_len = len(parent_tasks), len(child_tasks)
-                    
-                    if p_len == 1 and c_len > 1:
-                        for c_task in child_tasks: 
-                            _inject_edge(parent_tasks[0]._id, c_task._id)
-                    elif c_len == 1 and p_len > 1:
-                        for p_task in parent_tasks: 
-                            _inject_edge(p_task._id, child_tasks[0]._id)
-                    elif p_len == c_len:
-                        for p_task, c_task in zip(parent_tasks, child_tasks): 
-                            _inject_edge(p_task._id, c_task._id)
-                    else:
-                        for p_task in parent_tasks:
-                            for c_task in child_tasks: 
-                                _inject_edge(p_task._id, c_task._id)
+                    for p_leaf in parent_exits:
+                        parent_tasks = _get_exact_leaf_tasks(p_leaf)
+                        if not parent_tasks:
+                            continue
 
-            purged_ids = set()
-            def check_spur(s: str) -> bool: 
-                return "__" in s or "job" in s.lower() or "-injector" in s.lower() or "-collector" in s.lower() or "-token-transformer" in s.lower() or "-scatter" in s.lower() or "-condition" in s.lower()
-            
-            if "activity" in prov_data:
-                for act_id, act_meta in list(prov_data["activity"].items()):
-                    if check_spur(act_meta.get("prov:label", "")) or check_spur(act_id):
-                        purged_ids.add(act_id)
-                        del prov_data["activity"][act_id]
-                        
-            if "entity" in prov_data:
-                for ent_id, ent_meta in list(prov_data["entity"].items()):
-                    if check_spur(ent_meta.get("prov:label", "")) or check_spur(ent_id):
-                        purged_ids.add(ent_id)
-                        del prov_data["entity"][ent_id]
-                        
-            level_0_id = getattr(self.prov_workflow, '_id', None)
-            if level_0_id: 
-                purged_ids.add(level_0_id)
-                prov_data.get("activity", {}).pop(level_0_id, None)
-                
-            for r_type in ["wasInformedBy", "used", "wasGeneratedBy", "wasAssociatedWith"]:
-                if r_type in prov_data:
-                    for k in [k for k, v in prov_data[r_type].items() if any(v.get(p) in purged_ids for p in ["prov:activity", "prov:informant", "prov:informed", "prov:entity"])]:
-                        del prov_data[r_type][k]
+                        for c_leaf in child_entries:
+                            child_tasks = _get_exact_leaf_tasks(c_leaf)
+                            if not child_tasks:
+                                continue
+
+                            p_len, c_len = len(parent_tasks), len(child_tasks)
+
+                            if p_len == 1 and c_len > 1:
+                                for c_task in child_tasks:
+                                    _inject_edge(parent_tasks[0]._id, c_task._id)
+
+                            elif c_len == 1 and p_len > 1:
+                                for p_task in parent_tasks:
+                                    _inject_edge(p_task._id, child_tasks[0]._id)
+
+                            elif p_len == c_len:
+                                p_tags = {id(pt): _get_scatter_tag(pt) for pt in parent_tasks}
+                                c_tags = {id(ct): _get_scatter_tag(ct) for ct in child_tasks}
+                                if all(p_tags.values()) and all(c_tags.values()):
+                                    for ct in child_tasks:
+                                        c_tag = c_tags[id(ct)]
+                                        for pt in parent_tasks:
+                                            p_tag = p_tags[id(pt)]
+                                            if _tags_share_lineage(p_tag, c_tag) or _tags_are_compatible(getattr(pt, '_job_name', ''), getattr(ct, '_job_name', '')):
+                                                _inject_edge(pt._id, ct._id)
+                                else:
+                                    # Sort tasks deterministically prior to zipping
+                                    sorted_parents = sorted(parent_tasks, key=_get_task_sort_key)
+                                    sorted_children = sorted(child_tasks, key=_get_task_sort_key)
+                                    for p_task, c_task in zip(sorted_parents, sorted_children):
+                                        _inject_edge(p_task._id, c_task._id)
+
+                            else:
+                                p_tags = {id(pt): _get_scatter_tag(pt) for pt in parent_tasks}
+                                c_tags = {id(ct): _get_scatter_tag(ct) for ct in child_tasks}
+
+                                if all(p_tags.values()) and all(c_tags.values()):
+                                    for ct in child_tasks:
+                                        c_tag = c_tags[id(ct)]
+                                        for pt in parent_tasks:
+                                            p_tag = p_tags[id(pt)]
+                                            if _tags_share_lineage(p_tag, c_tag) or _tags_are_compatible(getattr(pt, '_job_name', ''), getattr(ct, '_job_name', '')):
+                                                _inject_edge(pt._id, ct._id)
+                                else:
+                                    # Match mismatched scatter widths (e.g. 625 vs 300) via shared entity keys
+                                    matched_any = False
+                                    for p_task in parent_tasks:
+                                        p_keys = _get_entity_keys(p_task, is_output=True)
+                                        if not p_keys:
+                                            continue
+
+                                        for c_task in child_tasks:
+                                            c_keys = _get_entity_keys(c_task, is_output=False)
+                                            
+                                            if p_keys & c_keys:
+                                                _inject_edge(p_task._id, c_task._id)
+                                                matched_any = True
+
+                                    # Fallback to cross-product only if no entity overlaps matched
+                                    if not matched_any:
+                                        for p_task in parent_tasks:
+                                            for c_task in child_tasks:
+                                                if _tags_are_compatible(getattr(p_task, '_job_name', ''), getattr(c_task, '_job_name', '')):
+                                                    _inject_edge(p_task._id, c_task._id)
 
             with open(json_file_path, 'w') as f: 
                 json.dump(prov_data, f, indent=4)
 
-            # Log provenance json file size metrics
             json_bytes = os.path.getsize(json_file_path)
             logger.info(f"YPROV [ARCHIVE]: [PROV_FILE_SIZE] provenance.json = {json_bytes} Bytes")
             logger.info(f"YPROV [ARCHIVE]: Edge reconciliation & PROV-JSON write completed in {time.perf_counter() - t_reconcile:.4f}s")
 
         except Exception as e:
-            logger.error(f"YPROV [ARCHIVE]: Internal sync failure during JSON edge cleanup: {e}")
+            logger.error(f"YPROV [ARCHIVE]: Internal sync failure during JSON edge cleanup: {e}\n{traceback.format_exc()}")
 
         t_zip = time.perf_counter()
         with ZipFile(path, "w") as archive:
