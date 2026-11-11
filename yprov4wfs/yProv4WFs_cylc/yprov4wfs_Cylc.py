@@ -229,13 +229,24 @@ def _parse_meta_list(value):
 
 
 def _expand_vars(path, env):
+    """Resolve configuration aliases without executing shell commands."""
     if not path:
         return path
 
-    def repl(match):
-        key = match.group(1)
-        return str(env.get(key, match.group(0)))
-    return re.sub(r"\$\{([^}]+)\}", repl, path)
+    pattern = re.compile(
+        r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+    )
+
+    def resolve(value, seen):
+        def replace(match):
+            key = match.group(1) or match.group(2)
+            if key not in env or key in seen:
+                return match.group(0)
+            return resolve(str(env[key]), seen | {key})
+
+        return pattern.sub(replace, value)
+
+    return resolve(str(path), set())
 
 
 def _build_data_info(path):
@@ -508,6 +519,7 @@ class Scheduler:
         self._prov_final_snapshot_saved = False
         self._prov_task_cache: Dict[str, Task] = {}
         self._prov_task_signatures: Dict[str, Any] = {}
+        self._prov_unresolved_paths_warned: Set[Tuple[str, str, str]] = set()
         self._prov_graph_cache_key: Optional[Tuple[Any, ...]] = None
         self._prov_graph_nodes: List[str] = []
         self._prov_graph_edges: List[Tuple[str, str]] = []
@@ -949,28 +961,46 @@ class Scheduler:
             self._prov_graph_cache_key = graph_cache_key
         return self._prov_graph_nodes, self._prov_graph_edges
 
-    @staticmethod
     def _expanded_prov_paths(
+        self,
         runtime_ctx: Dict[str, Any],
         point: str,
     ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
         meta = runtime_ctx.get('meta', {})
         env = dict(os.environ)
         env.update(runtime_ctx.get('environment', {}))
-        env['CYLC_TASK_CYCLE_POINT'] = point
-        env['CYCLE_DATE'] = point.split('T')[0]
+        task_name = runtime_ctx.get('name', '')
+        env.update({
+            'CYLC_WORKFLOW_ID': self.workflow,
+            'CYLC_WORKFLOW_INITIAL_CYCLE_POINT': str(self.config.initial_point),
+            'CYLC_WORKFLOW_FINAL_CYCLE_POINT': str(self.config.final_point),
+            'CYLC_TASK_NAME': task_name,
+            'CYLC_TASK_CYCLE_POINT': point,
+            'CYCLE_DATE': point.split('T')[0],
+        })
 
-        inputs = tuple(
-            expanded
-            for path in _parse_meta_list(meta.get('yprov_inputs'))
-            if (expanded := _expand_vars(path, env))
-        )
-        outputs = tuple(
-            expanded
-            for path in _parse_meta_list(meta.get('yprov_outputs'))
-            if (expanded := _expand_vars(path, env))
-        )
-        return inputs, outputs
+        def expand_paths(key):
+            paths = []
+            for path in _parse_meta_list(meta.get(key)):
+                expanded = _expand_vars(path, env)
+                if not expanded:
+                    continue
+                # Unknown/cyclic variables and shell expressions are not paths.
+                if re.search(r"\$(?:[A-Za-z_]|\{|\()|`", expanded):
+                    warning_key = (task_name, key, path)
+                    if warning_key not in self._prov_unresolved_paths_warned:
+                        LOG.warning(
+                            "yProv4WFs skipping unresolved %s path for %s/%s: "
+                            "%r -> %r (unknown/cyclic variable or unsupported "
+                            "shell expression)",
+                            key, point, task_name, path, expanded,
+                        )
+                        self._prov_unresolved_paths_warned.add(warning_key)
+                    continue
+                paths.append(expanded)
+            return tuple(paths)
+
+        return expand_paths('yprov_inputs'), expand_paths('yprov_outputs')
 
     @staticmethod
     def _prov_task_signature(
@@ -1020,20 +1050,27 @@ class Scheduler:
         if str(task_info[5]) == "1":
             task._manual_submit = "manually submitted"
 
+        seen_inputs = set()
         for input_path in input_paths:
             for item in _make_data_items(input_path):
-                task.add_input(item)
+                if item._id not in seen_inputs:
+                    task.add_input(item)
+                    seen_inputs.add(item._id)
+        seen_outputs = set()
         for output_path in output_paths:
             for item in _make_data_items(output_path):
-                task.add_output(item)
+                if item._id not in seen_outputs:
+                    task.add_output(item)
+                    seen_outputs.add(item._id)
 
         data_out = _make_data(
             get_task_job_job_log(
                 self.workflow, point, task_name, submit_num,
             )
         )
-        task.add_output(data_out)
-        data_out.set_producer(task._id)
+        if data_out._id not in seen_outputs:
+            task.add_output(data_out)
+            data_out.set_producer(task._id)
         return task
 
     async def populate_prov_workflow(
