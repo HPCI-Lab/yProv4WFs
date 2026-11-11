@@ -229,13 +229,24 @@ def _parse_meta_list(value):
 
 
 def _expand_vars(path, env):
+    """Resolve configuration aliases without executing shell commands."""
     if not path:
         return path
 
-    def repl(match):
-        key = match.group(1)
-        return str(env.get(key, match.group(0)))
-    return re.sub(r"\$\{([^}]+)\}", repl, path)
+    pattern = re.compile(
+        r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+    )
+
+    def resolve(value, seen):
+        def replace(match):
+            key = match.group(1) or match.group(2)
+            if key not in env or key in seen:
+                return match.group(0)
+            return resolve(str(env[key]), seen | {key})
+
+        return pattern.sub(replace, value)
+
+    return resolve(str(path), set())
 
 
 def _build_data_info(path):
@@ -299,50 +310,8 @@ def _coerce_submit_num(value) -> int:
         return 0
 
 
-def _select_runtime_entries(
-    runtime_data: Dict[str, Dict[str, Any]],
-    task_name: str,
-    point: str,
-) -> List[Dict[str, Any]]:
-    """Return real runtime entries for a task/cycle, ignoring NN-style placeholders."""
-    matches = [
-        runtime
-        for runtime in runtime_data.values()
-        if runtime.get('name') == task_name and str(runtime.get('point')) == point
-    ]
-    if not matches:
-        return []
-    real_matches = [
-        runtime for runtime in matches
-        if _coerce_submit_num(runtime.get('submit_num')) > 0
-    ]
-    return sorted(
-        real_matches,
-        key=lambda runtime: _coerce_submit_num(runtime.get('submit_num'))
-    )
-
-
-def _select_runtime_context(
-    runtime_data: Dict[str, Dict[str, Any]],
-    task_name: str,
-    point: str,
-) -> Dict[str, Any]:
-    """Return the best available runtime context for a task/cycle."""
-    runtimes = _select_runtime_entries(runtime_data, task_name, point)
-    if runtimes:
-        return runtimes[-1]
-    fallback = [
-        runtime
-        for runtime in runtime_data.values()
-        if runtime.get('name') == task_name and str(runtime.get('point')) == point
-    ]
-    if fallback:
-        return fallback[-1]
-    return {}
-
-
 def _freeze_signature_value(value: Any) -> Any:
-    """Convert runtime values into stable, comparable signature values."""
+    """Convert provenance values into stable, comparable signature values."""
     if isinstance(value, dict):
         return tuple(
             sorted(
@@ -501,13 +470,13 @@ class Scheduler:
 
     def __init__(self, id_: str, options: 'Values') -> None:
         # provenance tracking (yProv4WFs)
-        self.runtime_data: Dict[str, Dict[str, Any]] = {}
         self._prov_workflow_start: Optional[str] = None
         self._last_prov_snapshot_time: float = 0.0
         self._prov_snapshot_requested = False
         self._prov_final_snapshot_saved = False
         self._prov_task_cache: Dict[str, Task] = {}
         self._prov_task_signatures: Dict[str, Any] = {}
+        self._prov_unresolved_paths_warned: Set[Tuple[str, str, str]] = set()
         self._prov_graph_cache_key: Optional[Tuple[Any, ...]] = None
         self._prov_graph_nodes: List[str] = []
         self._prov_graph_edges: List[Tuple[str, str]] = []
@@ -949,46 +918,65 @@ class Scheduler:
             self._prov_graph_cache_key = graph_cache_key
         return self._prov_graph_nodes, self._prov_graph_edges
 
-    @staticmethod
-    def _expanded_prov_paths(
-        runtime_ctx: Dict[str, Any],
-        point: str,
-    ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-        meta = runtime_ctx.get('meta', {})
-        env = dict(os.environ)
-        env.update(runtime_ctx.get('environment', {}))
-        env['CYLC_TASK_CYCLE_POINT'] = point
-        env['CYCLE_DATE'] = point.split('T')[0]
+    def _prov_task_config(self, task_name: str) -> Dict[str, Any]:
+        """Read inherited task metadata/environment from the parsed config."""
+        taskdef = self.config.taskdefs.get(task_name)
+        return taskdef.rtconfig if taskdef is not None else {}
 
-        inputs = tuple(
-            expanded
-            for path in _parse_meta_list(meta.get('yprov_inputs'))
-            if (expanded := _expand_vars(path, env))
-        )
-        outputs = tuple(
-            expanded
-            for path in _parse_meta_list(meta.get('yprov_outputs'))
-            if (expanded := _expand_vars(path, env))
-        )
-        return inputs, outputs
+    def _expanded_prov_paths(
+        self,
+        task_config: Dict[str, Any],
+        task_name: str,
+        point: str,
+        submit_num: int,
+    ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+        meta = task_config.get('meta', {})
+        env = dict(os.environ)
+        env.update(task_config.get('environment', {}))
+        env.update({
+            'CYLC_WORKFLOW_ID': self.workflow,
+            'CYLC_WORKFLOW_INITIAL_CYCLE_POINT': str(self.config.initial_point),
+            'CYLC_WORKFLOW_FINAL_CYCLE_POINT': str(self.config.final_point),
+            'CYLC_TASK_NAME': task_name,
+            'CYLC_TASK_CYCLE_POINT': point,
+            'CYLC_TASK_SUBMIT_NUMBER': str(submit_num),
+            'CYLC_TASK_ID': f'{point}/{task_name}',
+            'CYCLE_DATE': point.split('T')[0],
+        })
+
+        def expand_paths(key):
+            paths = []
+            for path in _parse_meta_list(meta.get(key)):
+                expanded = _expand_vars(path, env)
+                if not expanded:
+                    continue
+                # Unknown/cyclic variables and shell expressions are not paths.
+                if re.search(r"\$(?:[A-Za-z_]|\{|\()|`", expanded):
+                    warning_key = (task_name, key, path)
+                    if warning_key not in self._prov_unresolved_paths_warned:
+                        LOG.warning(
+                            "yProv4WFs skipping unresolved %s path for %s/%s/%s: "
+                            "%r -> %r (unknown/cyclic variable or unsupported "
+                            "shell expression)",
+                            key, point, task_name, submit_num, path, expanded,
+                        )
+                        self._prov_unresolved_paths_warned.add(warning_key)
+                    continue
+                paths.append(expanded)
+            return tuple(paths)
+
+        return expand_paths('yprov_inputs'), expand_paths('yprov_outputs')
 
     @staticmethod
     def _prov_task_signature(
-        task_info: Optional[Tuple[Any, ...]],
-        runtime_ctx: Dict[str, Any],
+        task_info: Tuple[Any, ...],
         submit_num: int,
         input_paths: Tuple[str, ...],
         output_paths: Tuple[str, ...],
     ) -> Tuple[Any, ...]:
-        summary = runtime_ctx.get('summary', {})
-        runtime_times = (
-            summary.get('started_time_string'),
-            summary.get('finished_time_string'),
-        ) if task_info is None else None
         return (
             submit_num,
             _freeze_signature_value(task_info),
-            _freeze_signature_value(runtime_times),
             input_paths,
             output_paths,
         )
@@ -998,20 +986,13 @@ class Scheduler:
         task_name: str,
         point: str,
         submit_num: int,
-        task_info: Optional[Tuple[Any, ...]],
-        runtime_ctx: Dict[str, Any],
+        task_info: Tuple[Any, ...],
         input_paths: Tuple[str, ...],
         output_paths: Tuple[str, ...],
     ) -> Task:
         task = Task(str(uuid4()), task_name)
         task._level = '1'
         task.set_id(f"{point}/{task_name}/{submit_num}")
-
-        if task_info is None:
-            summary = runtime_ctx.get('summary', {})
-            task._start_time = summary.get('started_time_string', 'N/A')
-            task._end_time = summary.get('finished_time_string', 'N/A')
-            return task
 
         task._start_time = task_info[0] or 'N/A'
         task._end_time = task_info[3] or 'N/A'
@@ -1020,20 +1001,27 @@ class Scheduler:
         if str(task_info[5]) == "1":
             task._manual_submit = "manually submitted"
 
+        seen_inputs = set()
         for input_path in input_paths:
             for item in _make_data_items(input_path):
-                task.add_input(item)
+                if item._id not in seen_inputs:
+                    task.add_input(item)
+                    seen_inputs.add(item._id)
+        seen_outputs = set()
         for output_path in output_paths:
             for item in _make_data_items(output_path):
-                task.add_output(item)
+                if item._id not in seen_outputs:
+                    task.add_output(item)
+                    seen_outputs.add(item._id)
 
         data_out = _make_data(
             get_task_job_job_log(
                 self.workflow, point, task_name, submit_num,
             )
         )
-        task.add_output(data_out)
-        data_out.set_producer(task._id)
+        if data_out._id not in seen_outputs:
+            task.add_output(data_out)
+            data_out.set_producer(task._id)
         return task
 
     async def populate_prov_workflow(
@@ -1076,20 +1064,17 @@ class Scheduler:
                 task_name = tokens['task']
                 point = str(tokens['cycle'])
                 attempts = task_attempts.get((task_name, point), [])
-                runtime_ctx = _select_runtime_context(
-                    self.runtime_data, task_name, point
-                )
-                if not attempts and not runtime_ctx:
+                if not attempts:
                     continue
 
-                input_paths, output_paths = self._expanded_prov_paths(
-                    runtime_ctx, point)
+                task_config = self._prov_task_config(task_name)
                 latest_task: Optional[Task] = None
                 for submit_num, task_info in attempts:
+                    input_paths, output_paths = self._expanded_prov_paths(
+                        task_config, task_name, point, submit_num)
                     task_id = f"{point}/{task_name}/{submit_num}"
                     signature = self._prov_task_signature(
                         task_info,
-                        runtime_ctx,
                         submit_num,
                         input_paths,
                         output_paths,
@@ -1104,7 +1089,6 @@ class Scheduler:
                             point,
                             submit_num,
                             task_info,
-                            runtime_ctx,
                             input_paths,
                             output_paths,
                         )
@@ -1113,40 +1097,6 @@ class Scheduler:
                     latest_task = self._prov_task_cache[task_id]
                     active_task_ids.add(task_id)
                     ordered_task_ids.append(task_id)
-
-                if latest_task is None and runtime_ctx:
-                    submit_num = _coerce_submit_num(
-                        runtime_ctx.get('submit_num'))
-                    if submit_num > 0:
-                        task_id = f"{point}/{task_name}/{submit_num}"
-                        signature = self._prov_task_signature(
-                            None,
-                            runtime_ctx,
-                            submit_num,
-                            input_paths,
-                            output_paths,
-                        )
-                        if (
-                            full
-                            or task_id not in self._prov_task_cache
-                            or self._prov_task_signatures.get(task_id)
-                            != signature
-                        ):
-                            self._prov_task_cache[
-                                task_id
-                            ] = self._build_prov_task(
-                                task_name,
-                                point,
-                                submit_num,
-                                None,
-                                runtime_ctx,
-                                input_paths,
-                                output_paths,
-                            )
-                            self._prov_task_signatures[task_id] = signature
-                        latest_task = self._prov_task_cache[task_id]
-                        active_task_ids.add(task_id)
-                        ordered_task_ids.append(task_id)
 
                 if latest_task is not None:
                     task_map[node] = latest_task
@@ -2229,20 +2179,6 @@ class Scheduler:
             self.xtrigger_mgr.housekeep(self.pool.get_tasks())
         self.pool.clock_expire_tasks()
         self.release_tasks_to_run()
-
-        # collect runtime data for provenance (yProv4WFs)
-        for itask in self.pool.get_tasks():
-            name = itask.identity
-            if name not in self.runtime_data:
-                self.runtime_data[name] = {}
-            self.runtime_data[name]['identity'] = name
-            self.runtime_data[name]['summary'] = itask.summary
-            self.runtime_data[name]['name'] = itask.tdef.name
-            self.runtime_data[name]['point'] = itask.point
-            self.runtime_data[name]['submit_num'] = itask.submit_num
-            self.runtime_data[name]['meta'] = itask.tdef.rtconfig.get('meta', {})
-            self.runtime_data[name]['environment'] = (
-                itask.tdef.rtconfig.get('environment', {}))
 
         if (
             self.get_run_mode() == RunMode.SIMULATION
